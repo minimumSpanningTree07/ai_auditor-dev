@@ -1,5 +1,5 @@
 
-'''Trusted values that matches with the dummy json data'''
+-- Trusted values that matches with the dummy json data
 CREATE SCHEMA IF NOT EXISTS erp;
 
 CREATE TABLE IF NOT EXISTS erp.vendors (

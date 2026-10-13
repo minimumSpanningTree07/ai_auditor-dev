@@ -29,18 +29,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-        
+
   mock-erp:
-  build: ./mock-erp
-  ports:
-    - "8001:8000"
-  environment:
-    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-  depends_on:
-    postgres:
-      condition: service_healthy
-    erp-seed:
-      condition: service_completed_successfully
+    build: ./mock_erp
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      erp-seed:
+        condition: service_completed_successfully
       
 volumes:
   postgres_data:

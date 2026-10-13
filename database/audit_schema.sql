@@ -1,4 +1,4 @@
-"""This tables for auditing"""
+-- This tables for auditing
 CREATE SCHEMA IF NOT EXISTS audit;
 
 CREATE TABLE audit.invoice_audit (
