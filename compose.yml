@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: invoice-postgres
+    environment:
+      POSTGRES_DB: invoice_auditor
+      POSTGRES_USER: auditor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+
+  erp-seed:
+    build:
+      context: ./database
+      dockerfile: dockerfile.seed
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ERP_MOCKDATA_DIR: /app/erp_mockdata
+    volumes:
+      - ./data/ERP_mockdata:/app/erp_mockdata:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+        
+  mock-erp:
+  build: ./mock-erp
+  ports:
+    - "8001:8000"
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    erp-seed:
+      condition: service_completed_successfully
+      
+volumes:
+  postgres_data:
