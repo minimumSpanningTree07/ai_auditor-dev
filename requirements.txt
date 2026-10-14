@@ -3,8 +3,6 @@ python-docx
 pytesseract
 Pillow
 pdf2image
-
-
 langchain-aws
 redis
 pydantic
