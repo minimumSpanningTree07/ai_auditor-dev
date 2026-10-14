@@ -85,8 +85,8 @@ def extract_invoice_info(file_path:str|Path, file_type : str|None = None )-> dic
             "file_type":extension,
             "raw_extracted_text":None,
             "extrcated_method":None,
-            "status":"failed",
-            "error":f"File not found:{path}"
+            "extraction_status":"failed",
+            "extraction_error":f"File not found:{path}"
         }
 
     try:
@@ -96,20 +96,20 @@ def extract_invoice_info(file_path:str|Path, file_type : str|None = None )-> dic
             # print("called extract_pdf")
         elif extension ==".docx":
             extracted_text,method =extract_pdf(path)
-        if extension in {".png",".png",".jpeg"}:
+        elif extension in {".png",".png",".jpeg"}:
             extracted_text,method =extract_pdf(path)
         else:
             raise ValueError(f"Unsupported file type:{extension}")
-        status = "success" if extracted_text else "empty"
+        extraction_status = "success" if extracted_text else "empty"
 
         return {
             "file_name":path.name,
             "file_path":str(path),
             "file_type":extension,
             "raw_extracted_text":extracted_text,
-            "extrcated_method":method,
-            "status": status,
-            "error":None if extracted_text else "No text was extracted"
+            "extrated_method":method,
+            "extraction_status": extraction_status,
+            "extraction_error":None if extracted_text else "No text was extracted"
         }
 
     except Exception as ex:
@@ -118,10 +118,10 @@ def extract_invoice_info(file_path:str|Path, file_type : str|None = None )-> dic
             "file_path":str(path),
             "file_type":extension,
             "raw_extracted_text":None,
-            "extrcated_method":None,
-            "status":"failed",
-            "error":f"{type(ex).__name__}:{ex}"
+            "extracted_method":None,
+            "extraction_status":"failed",
+            "extraction_error":f"{type(ex).__name__}:{ex}"
         }
 
-# extract_invoice_info("data/incoming/INV_EN_001.pdf",".pdf")
+# extract_invoice_info("/home/labuser/Desktop/aug26-sp1-l1-fa3-proj-group-38/data/incoming/INV_EN_002.pdf",".pdf")
 
