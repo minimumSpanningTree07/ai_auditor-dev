@@ -53,3 +53,15 @@ CREATE TABLE audit.human_feedback (
     corrected_at TIMESTAMPTZ DEFAULT now(),
     revalidated BOOLEAN DEFAULT FALSE
 );
+
+CREATE TABLE IF NOT EXISTS audit.file_monitor (
+    id BIGSERIAL PRIMARY KEY,
+    file_path TEXT NOT NULL,
+    file_checksum VARCHAR(64),
+    file_type VARCHAR(16),
+    processing_status VARCHAR(20) NOT NULL DEFAULT 'detected',
+    error_message TEXT,
+    detected_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (file_path, file_checksum)
+);
