@@ -101,11 +101,12 @@ services:
       REPORT_OUTPUT_DIR: /app/outputs/reports
       AWS_REGION: us-east-1
       AWS_DEFAULT_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
     volumes:
       - ./data/incoming:/app/data/incoming
       - ./outputs/reports:/app/outputs/reports
+      - /home/labuser/.aws:/root/.aws:ro
     depends_on:
       postgres:
         condition: service_healthy
