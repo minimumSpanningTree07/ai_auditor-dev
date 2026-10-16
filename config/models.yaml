@@ -1,0 +1,20 @@
+models:
+  reasoning:
+    provider: bedrock
+    model: amazon.nova-lite-v1:0
+    temperature: 0.0
+
+  rag_generation:
+    provider: bedrock
+    model: cohere.command-r-plus-v1:0
+    temperature: 0.0
+
+  translation:
+    provider: bedrock
+    model: cohere.command-r-plus-v1:0
+    temperature: 0.0
+
+rag:
+  top_k: 5
+  score_threshold: 0.70
+  max_retries: 3

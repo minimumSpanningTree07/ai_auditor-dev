@@ -17,7 +17,7 @@ def load_json(filename):
 
 def seed():
     #create connection and cursor objects
-    with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with psycopg.connect(os.getenv("DATABASE_URL")) as conn:
         with conn.cursor() as cur:
              # Insert vendors first
             for vendor in load_json("vendors.json"):

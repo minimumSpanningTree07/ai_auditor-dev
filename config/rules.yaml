@@ -1,91 +1,113 @@
-# =============================================================
-# AI Invoice Auditor – Validation Rules Configuration
-# =============================================================
-# This file defines the business and data validation rules
-# applied by the Invoice Data Validation Agent and Business Validation Agent.
-# =============================================================
+validation:
+  amounts:
+    tolerance: 0.01
 
-# -------------------------------------------------------------
-# 1. General Invoice Requirements
-# -------------------------------------------------------------
-required_fields:
-  header:
-    - invoice_no
+  required_fields:
+    - invoice_number
+    - vendor_name
     - invoice_date
-    - vendor_id
     - currency
     - total_amount
-  line_item:
-    - item_code
-    - description
-    - qty
-    - unit_price
-    - total
 
-# -------------------------------------------------------------
-# 2. Field Data Type Rules
-# -------------------------------------------------------------
-data_types:
-  invoice_no: str
-  invoice_date: date
-  vendor_id: str
-  currency: str
-  total_amount: float
-  qty: float
-  unit_price: float
-  total: float
+  checks:
+    - subtotal_matches_lines
+    - tax_matches_rate
+    - total_matches_subtotal_tax
+    - currency_matches_erp
+    - vendor_matches_erp
+    - purchase_order_exists
+    - purchase_order_vendor_matches
+    - purchase_order_lines_match
 
-# -------------------------------------------------------------
-# 3. Business Validation Thresholds
-# -------------------------------------------------------------
-tolerances:
-  # Maximum allowed deviation when comparing invoice vs ERP
-  price_difference_percent: 5       # ±5% tolerance in unit price
-  quantity_difference_percent: 0    # Quantity must match exactly
-  tax_difference_percent: 2         # ±2% tolerance for tax amounts
+business_rules:
+  vendor:
+    require_active: true
+    fuzzy_match: true
+    minimum_match_score: 0.80
 
-# -------------------------------------------------------------
-# 4. Currency Validation Rules
-# -------------------------------------------------------------
-accepted_currencies:
-  - USD
-  - EUR
-  - INR
-  - GBP
+  purchase_order:
+    required: true
+    require_open_status: false
 
-# Define fallback mapping for currency symbols → ISO codes
-currency_symbol_map:
-  "$": "USD"
-  "€": "EUR"
-  "₹": "INR"
-  "£": "GBP"
+  line_items:
+    quantity_tolerance: 0.0001
+    unit_price_tolerance: 0.01
+    line_total_tolerance: 0.01
 
-# -------------------------------------------------------------
-# 5. Validation Policies
-# -------------------------------------------------------------
-validation_policies:
-  # Missing mandatory field handling
-  missing_field_action: "flag"
-  # If totals mismatch beyond tolerance
-  total_mismatch_action: "manual_review"
-  # For currency not in accepted list
-  invalid_currency_action: "reject"
-  # Auto-approval threshold (if no discrepancy & translation confidence ≥ 0.95)
-  auto_approve_confidence_threshold: 0.95
+  tax:
+    rate_tolerance: 0.0001
+    amount_tolerance: 0.01
 
-# -------------------------------------------------------------
-# 6. Reporting Parameters
-# -------------------------------------------------------------
-reporting:
-  include_translation_confidence: true
-  include_discrepancy_summary: true
-  report_format: "HTML"
-  output_dir: "./outputs/reports"
+discrepancies:
+  severity:
+    missing_required_field: high
+    vendor_mismatch: high
+    purchase_order_not_found: high
+    purchase_order_vendor_mismatch: high
+    currency_mismatch: high
+    quantity_mismatch: medium
+    unit_price_mismatch: high
+    line_total_mismatch: high
+    subtotal_mismatch: high
+    tax_mismatch: high
+    total_mismatch: high
+    extraction_error: high
+    translation_error: medium
 
-# -------------------------------------------------------------
-# 7. Logging and Audit Settings
-# -------------------------------------------------------------
-logging:
-  enable_audit_log: true
-  log_file: "./logs/invoice_auditor.log"
-  log_level: "INFO"
+workflow:
+  statuses:
+    approved: APPROVED
+    manual_review: MANUAL_REVIEW
+    rejected: REJECTED
+
+  human_review:
+    enabled: true
+    require_for:
+      - missing_required_field
+      - vendor_mismatch
+      - purchase_order_not_found
+      - purchase_order_vendor_mismatch
+      - currency_mismatch
+      - quantity_mismatch
+      - unit_price_mismatch
+      - line_total_mismatch
+      - subtotal_mismatch
+      - tax_mismatch
+      - total_mismatch
+
+rag:
+  enabled: true
+  top_k: 5
+  relevance_threshold: 0.70
+  max_retries: 3
+
+  routing:
+    structured_keywords:
+      - invoice
+      - vendor
+      - purchase order
+      - po
+      - sku
+      - discrepancy
+      - validation
+      - total
+      - tax
+      - currency
+
+    semantic_keywords:
+      - why
+      - explain
+      - policy
+      - similar
+      - history
+      - recommendation
+      - reason
+      - trend
+
+persistence:
+  immutable_extraction: true
+  store_raw_text: true
+  store_translated_text: true
+  store_reports: true
+  store_human_feedback: true
+  audit_events: true

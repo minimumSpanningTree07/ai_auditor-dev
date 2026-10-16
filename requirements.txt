@@ -2,8 +2,9 @@ langchain_text_splitters
 langgraph
 langchain-core
 langchain-aws
+langgraph-checkpoint-postgres
 pydantic
-psycopg[binary]
+psycopg2-binary
 PyYAML
 requests
 redis
@@ -18,3 +19,7 @@ fastapi
 uvicorn[standard]
 litellm
 langchain-qdrant 
+python-multipart
+streamlit
+
+

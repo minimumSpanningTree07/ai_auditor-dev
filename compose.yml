@@ -1,29 +1,30 @@
-
 services:
   postgres:
-    image: postgres:16
-    container_name: invoice-postgres
+    image: postgres:16-alpine
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
-      POSTGRES_USER: ${POSTGRES_USER:-auditor}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: ${POSTGRES_USER:-invoice_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoice_password}
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database:/docker-entrypoint-initdb.d:ro
+      - ./database/01_erp_schema.sql:/docker-entrypoint-initdb.d/01_erp_schema.sql:ro
+      - ./database/02_erp_seed.sql:/docker-entrypoint-initdb.d/02_erp_seed.sql:ro
+      - ./database/03_audit_schema.sql:/docker-entrypoint-initdb.d/03_audit_schema.sql:ro
     healthcheck:
-      test:
-        - CMD-SHELL
-        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invoice_user} -d ${POSTGRES_DB:-invoice_auditor}"]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
   redis:
-    image: redis:7
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -32,55 +33,42 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:v1.15.4
+    image: qdrant/qdrant:latest
     ports:
-      - "6335:6333"
-      - "6334:6334"
+      - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test:
-        - CMD-SHELL
-        - 'bash -c "</dev/tcp/127.0.0.1/6333"'
-      interval: 10s
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 5s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
-
-  erp-seed:
-    build:
-      context: ./database
-      dockerfile: dockerfile.seed
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-auditor}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
-      ERP_MOCKDATA_DIR: /app/erp_mockdata
-    volumes:
-      - ./data/ERP_mockdata:/app/erp_mockdata:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: "no"
+      start_period: 10s
 
   mock-erp:
     build:
-      context: ./mock_erp
-      dockerfile: dockerfile
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-auditor}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
+      context: .
+      dockerfile: docker/mock-erp.Dockerfile
     ports:
-      - "8002:8000"
+      - "8001:8000"
     depends_on:
       postgres:
         condition: service_healthy
-      erp-seed:
-        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
+      POSTGRES_USER: ${POSTGRES_USER:-invoice_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoice_password}
     healthcheck:
       test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-      interval: 10s
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"
+        ]
+      interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
@@ -88,25 +76,9 @@ services:
   agent:
     build:
       context: .
-      dockerfile: dockerfile.agent
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-auditor}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
-      MOCK_ERP_URL: http://mock-erp:8000
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      QDRANT_URL: http://qdrant:6333
-      INCOMING_DIR: /app/data/incoming
-      REPORT_OUTPUT_DIR: /app/outputs/reports
-      AWS_REGION: us-east-1
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
-      AWS_CONFIG_FILE: /root/.aws/config
-    volumes:
-      - ./data/incoming:/app/data/incoming
-      - ./outputs/reports:/app/outputs/reports
-      - /home/labuser/.aws:/root/.aws:ro
+      dockerfile: docker/agent.Dockerfile
+    ports:
+      - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -116,25 +88,53 @@ services:
         condition: service_healthy
       mock-erp:
         condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
+      POSTGRES_USER: ${POSTGRES_USER:-invoice_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoice_password}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-invoice_documents}
+      MOCK_ERP_URL: http://mock-erp:8000
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
+    volumes:
+      - ./data/incoming:/app/data/incoming
+      - ./outputs/reports:/app/outputs/reports
+      - /home/labuser/.aws:/root/.aws:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
-  streamlit-ui:
+  ui:
     build:
-      context: ./ui
-      dockerfile: Dockerfile
-    environment:
-      AGENT_API_URL: http://agent:8000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-auditor}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
+      context: .
+      dockerfile: docker/ui.Dockerfile
     ports:
-      - "8502:8501"
+      - "8501:8501"
     depends_on:
-      postgres:
-        condition: service_healthy
       agent:
-        condition: service_started
+        condition: service_healthy
+    environment:
+      AGENT_URL: http://agent:8000
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
   qdrant_data:
-

@@ -1,0 +1,61 @@
+personas:
+
+  invoice_validation:
+    name: Invoice Validation Agent
+    role: >
+      Validate invoice completeness, internal arithmetic,
+      tax calculations, and configurable business rules.
+    responsibilities:
+      - Check field completeness
+      - Verify line totals
+      - Verify tax calculations
+      - Highlight missing fields
+      - Highlight internally inconsistent fields
+
+  business_validation:
+    name: Business Validation Agent
+    role: >
+      Compare extracted invoice information against ERP
+      records obtained through the mock-erp HTTP API.
+    responsibilities:
+      - Compare quantity
+      - Compare unit price
+      - Compare currency
+      - Apply configured tolerance thresholds
+      - Record discrepancies
+
+  reporting:
+    name: Reporting Agent
+    role: >
+      Produce an auditable discrepancy report and recommendation.
+    responsibilities:
+      - Summarize discrepancies
+      - Report missing fields
+      - Include translation confidence
+      - Recommend approve
+      - Recommend manual review
+      - Recommend reject
+
+  rag:
+    name: RAG Agent
+    role: >
+      Answer natural-language questions about processed invoices
+      and their reports using retrieval-augmented generation.
+    responsibilities:
+      - Retrieve relevant invoice and report content
+      - Assemble context
+      - Generate grounded answers
+      - Evaluate answer quality using the RAG Triad
+      - Retry retrieval when the score is insufficient
+
+  human_auditor:
+    name: Human Auditor
+    role: >
+      Review invoice reports, correct extracted values,
+      ask questions, and provide feedback.
+    responsibilities:
+      - Review discrepancies
+      - Correct extracted values
+      - Ask natural-language questions
+      - Record feedback
+      - Request re-validation
