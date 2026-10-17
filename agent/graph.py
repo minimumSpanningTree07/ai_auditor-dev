@@ -97,21 +97,26 @@ def route_after_data_validation(state: InvoiceState) -> str:
 
     return "business_validation"
 
-
 def route_after_business_validation(state: InvoiceState) -> str:
     if state.get("processing_status") == "failed":
         return "end"
 
-    if (
-        state.get("human_review_required")
-        or not state.get("data_validation_passed", False)
-        or not state.get("business_validation_passed", False)
-        or state.get("missing_erp_records")
-        or state.get("erp_lookup_failed")
-    ):
-        return "human_review"
-
     return "reporting"
+
+# def route_after_business_validation(state: InvoiceState) -> str:
+#     if state.get("processing_status") == "failed":
+#         return "end"
+
+#     if (
+#         state.get("human_review_required")
+#         or not state.get("data_validation_passed", False)
+#         or not state.get("business_validation_passed", False)
+#         or state.get("missing_erp_records")
+#         or state.get("erp_lookup_failed")
+#     ):
+#         return "human_review"
+
+#     return "reporting"
 
 
 def route_after_human_review(state: InvoiceState) -> str:
@@ -137,12 +142,20 @@ def route_after_reporting(state: InvoiceState) -> str:
 
     return "persistence"
 
-
 def route_after_persistence(state: InvoiceState) -> str:
     if state.get("persistence_status") != "persisted":
         return "end"
 
+    if state.get("human_review_required"):
+        return "human_review"
+
     return "rag_indexing"
+
+# def route_after_persistence(state: InvoiceState) -> str:
+#     if state.get("persistence_status") != "persisted":
+#         return "end"
+
+#     return "rag_indexing"
 
 
 # ---------------------------------------------------------------------
@@ -372,10 +385,19 @@ def build_invoice_graph():
         route_after_business_validation,
         {
             "end": END,
-            "human_review": "human_review",
             "reporting": "reporting",
         },
     )
+
+    # builder.add_conditional_edges(
+    #     "business_validation",
+    #     route_after_business_validation,
+    #     {
+    #         "end": END,
+    #         "human_review": "human_review",
+    #         "reporting": "reporting",
+    #     },
+    # )
 
     builder.add_conditional_edges(
         "human_review",
@@ -400,9 +422,18 @@ def build_invoice_graph():
         route_after_persistence,
         {
             "end": END,
+            "human_review": "human_review",
             "rag_indexing": "rag_indexing",
         },
     )
+    # builder.add_conditional_edges(
+    #     "persistence",
+    #     route_after_persistence,
+    #     {
+    #         "end": END,
+    #         "rag_indexing": "rag_indexing",
+    #     },
+    # )
 
     builder.add_edge("rag_indexing", END)
 

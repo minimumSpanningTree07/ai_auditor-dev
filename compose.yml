@@ -106,12 +106,14 @@ services:
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       LLM_MODEL: ${LLM_MODEL:-bedrock/amazon.nova-lite-v1:0}
       OCR_LANGUAGES: ${OCR_LANGUAGES:-eng+spa+deu}
-
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
     env_file:
       - .env
     volumes:
       - ./data/incoming:/app/data/incoming
       - ./outputs/reports:/app/outputs/reports
+      - ./home/labuser/.aws:/root/.aws:ro
     healthcheck:
       test:
         [

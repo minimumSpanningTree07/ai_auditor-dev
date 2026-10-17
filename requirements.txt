@@ -4,7 +4,7 @@ langgraph
 langchain-core
 langchain-aws
 langgraph-checkpoint-postgres
-psycopg[binary]>=3.2,<4
+psycopg-binary>=3.2,<4
 pydantic
 psycopg2-binary
 PyYAML

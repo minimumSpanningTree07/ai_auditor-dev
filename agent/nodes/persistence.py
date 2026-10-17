@@ -192,8 +192,7 @@ def persist_invoice(
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s
+                %s, %s, %s, %s, %s
             )
             ON CONFLICT (invoice_id)
             DO UPDATE SET

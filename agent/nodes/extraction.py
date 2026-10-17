@@ -45,7 +45,7 @@ def _extract_text_file(path: Path) -> str:
 
 def _extract_pdf_text(path: Path) -> str:
     try:
-        import fitz
+        import pymupdf
     except ImportError as exc:
         raise RuntimeError(
             "PyMuPDF is required for PDF extraction."
@@ -53,7 +53,7 @@ def _extract_pdf_text(path: Path) -> str:
 
     pages: list[str] = []
 
-    with fitz.open(path) as document:
+    with pymupdf.open(path) as document:
         for page in document:
             text = page.get_text("text")
 

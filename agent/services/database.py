@@ -340,25 +340,14 @@ class Database:
         self,
         query: str,
         params: Iterable[Any] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> Any | None:
         """
-        Execute an INSERT ... RETURNING statement.
-
-        Useful when PostgreSQL generates:
-            invoice_id
-            audit_id
-            feedback_id
-            etc.
+        Execute INSERT ... RETURNING and return the first returned value.
         """
 
         try:
-
             with self.transaction() as connection:
-
-                with connection.cursor(
-                    cursor_factory=RealDictCursor
-                ) as cursor:
-
+                with connection.cursor() as cursor:
                     cursor.execute(
                         query,
                         tuple(params) if params is not None else None,
@@ -369,7 +358,15 @@ class Database:
                     if row is None:
                         return None
 
-                    return dict(row)
+                    # PostgreSQL RETURNING should always provide at least
+                    # one column. Fail with useful diagnostics otherwise.
+                    if len(row) < 1:
+                        raise DatabaseErrorHandler(
+                            f"INSERT ... RETURNING returned an empty row. "
+                            f"Query={query[:300]}"
+                        )
+
+                    return row[0]
 
         except DatabaseErrorHandler:
             raise
@@ -378,7 +375,6 @@ class Database:
             raise DatabaseErrorHandler(
                 f"Database insert_returning failed: {exc}"
             ) from exc
-
     # ============================================================
     # HEALTH CHECK
     # ============================================================

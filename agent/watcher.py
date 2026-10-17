@@ -93,20 +93,38 @@ class InvoiceWatcher:
             self.processing.discard(key)
 
     async def scan_once(self) -> None:
-        try:
-            files = self.discover_files()
-            if files:
-                logger.info("Watcher found %d supported invoice file(s) in %s", len(files), self.directory)
-            present = {str(p.resolve()) for p in files}
-            # Forget removed/renamed files so a later re-upload is handled cleanly.
-            for key in list(self.completed):
-                if key not in present:
-                    self.completed.pop(key, None)
-                    self.retry_after.pop(key, None)
-            for path in files:
-                await self.process_file(path)
-        except Exception:
-            logger.exception("Watcher scan failed")
+        files = self.discover_files()
+        current_files = {str(path.resolve()): path for path in files}
+
+        new_files = set(current_files) - self.known_files
+        self.known_files = set(current_files)
+
+        if new_files:
+            logger.info(
+                "Watcher found %d new invoice file(s) in %s",
+                len(new_files),
+                self.directory,
+            )
+
+        for file_key in sorted(new_files):
+            path = current_files[file_key]
+            await self.process_file(path)
+            
+    # async def scan_once(self) -> None:
+    #     try:
+    #         files = self.discover_files()
+    #         if files:
+    #             logger.info("Watcher found %d supported invoice file(s) in %s", len(files), self.directory)
+    #         present = {str(p.resolve()) for p in files}
+    #         # Forget removed/renamed files so a later re-upload is handled cleanly.
+    #         for key in list(self.completed):
+    #             if key not in present:
+    #                 self.completed.pop(key, None)
+    #                 self.retry_after.pop(key, None)
+    #         for path in files:
+    #             await self.process_file(path)
+    #     except Exception:
+    #         logger.exception("Watcher scan failed")
 
     async def run(self) -> None:
         logger.info("Invoice watcher started directory=%s interval=%ss", self.directory, self.interval)
