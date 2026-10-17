@@ -1,8 +1,10 @@
+
 langchain_text_splitters
 langgraph
 langchain-core
 langchain-aws
 langgraph-checkpoint-postgres
+psycopg[binary]>=3.2,<4
 pydantic
 psycopg2-binary
 PyYAML
@@ -18,8 +20,8 @@ qdrant-client
 fastapi
 uvicorn[standard]
 litellm
-langchain-qdrant 
+langchain-qdrant
 python-multipart
 streamlit
-
-
+PyMuPDF
+langdetect

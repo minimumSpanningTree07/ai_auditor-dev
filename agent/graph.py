@@ -1,239 +1,477 @@
+
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 
-from agent.nodes.business_validation import business_validate
-from agent.nodes.data_validation import data_validate
-from agent.nodes.extraction import extract_invoice
-from agent.nodes.field_extraction import extract_fields
-from agent.nodes.monitor import monitor_invoice
-from agent.nodes.persistence import persist_invoice
-from agent.nodes.reporting import generate_report
-from agent.nodes.translation import translate_invoice
 from agent.state import InvoiceState
+from agent.nodes.monitor import monitor_invoice
+from agent.nodes.extraction import extract_invoice
+from agent.nodes.translation import translate_invoice
+from agent.nodes.field_extraction import extract_fields
+from agent.nodes.data_validation import data_validate
+from agent.nodes.business_validation import business_validate
+from agent.nodes.reporting import generate_report
+from agent.nodes.persistence import persist_invoice
+
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
 
 
-def _should_continue_after_monitor(
-    state: InvoiceState,
-) -> str:
-    if state.get("processing_status") in {
-        "failed",
-        "duplicate",
-    }:
-        return END
+# ---------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------
 
-    return "extraction"
+_checkpointer: Any = None
+_checkpointer_connection: Any = None
 
 
-def _should_continue_after_extraction(
-    state: InvoiceState,
-) -> str:
+def build_checkpointer() -> Any:
+    """
+    Build a PostgreSQL checkpointer so interrupted invoice workflows
+    can be resumed after an API request or process restart.
+
+    DATABASE_URL must point to the PostgreSQL database used for
+    LangGraph checkpoint storage.
+    """
+    global _checkpointer, _checkpointer_connection
+
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL is required for durable human-review "
+            "pause/resume. Configure it before starting the agent."
+        )
+
+    _checkpointer_connection = psycopg.connect(
+        database_url,
+        autocommit=True,
+    )
+
+    _checkpointer = PostgresSaver(_checkpointer_connection)
+    _checkpointer.setup()
+
+    return _checkpointer
+
+
+# ---------------------------------------------------------------------
+# Workflow routing
+# ---------------------------------------------------------------------
+
+def route_after_monitor(state: InvoiceState) -> str:
+    if state.get("is_duplicate"):
+        return "end"
+
+    if state.get("processing_status") in {"idle", "failed"}:
+        return "end"
+
+    return "extract"
+
+
+def route_after_extraction(state: InvoiceState) -> str:
     if state.get("processing_status") == "failed":
-        return END
+        return "end"
 
-    return "translation"
+    return "translate"
 
 
-def _should_continue_after_translation(
-    state: InvoiceState,
-) -> str:
+def route_after_translation(state: InvoiceState) -> str:
     if state.get("processing_status") == "failed":
-        return END
+        return "end"
 
     return "field_extraction"
 
 
-def _should_continue_after_persistence(
-    state: InvoiceState,
-) -> str:
-    if state.get("persistence_status") == "failed":
-        return END
+def route_after_data_validation(state: InvoiceState) -> str:
+    """
+    Business validation is performed after data validation, even when
+    data validation finds issues. Both sets of results are useful to
+    the human reviewer.
+    """
+    if state.get("processing_status") == "failed":
+        return "end"
+
+    return "business_validation"
+
+
+def route_after_business_validation(state: InvoiceState) -> str:
+    if state.get("processing_status") == "failed":
+        return "end"
+
+    if (
+        state.get("human_review_required")
+        or not state.get("data_validation_passed", False)
+        or not state.get("business_validation_passed", False)
+        or state.get("missing_erp_records")
+        or state.get("erp_lookup_failed")
+    ):
+        return "human_review"
+
+    return "reporting"
+
+
+def route_after_human_review(state: InvoiceState) -> str:
+    """
+    After resume, the human-review node marks the state for revalidation.
+    A rejected invoice goes to reporting; otherwise rerun data validation
+    and business validation using corrected values.
+    """
+    decision = str(state.get("human_decision") or "").strip().lower()
+
+    if decision in {"reject", "rejected"}:
+        return "reporting"
+
+    if state.get("human_review_action") == "revalidate":
+        return "data_validation"
+
+    return "reporting"
+
+
+def route_after_reporting(state: InvoiceState) -> str:
+    if state.get("processing_status") == "failed":
+        return "end"
+
+    return "persistence"
+
+
+def route_after_persistence(state: InvoiceState) -> str:
+    if state.get("persistence_status") != "persisted":
+        return "end"
 
     return "rag_indexing"
 
 
-def _rag_indexing(
-    state: InvoiceState,
-) -> dict[str, Any]:
-    """
-    Index the completed invoice into the derived Qdrant index.
+# ---------------------------------------------------------------------
+# Human-review pause
+# ---------------------------------------------------------------------
 
-    RAG indexing failure must not invalidate invoice persistence.
+def human_review_pause(state: InvoiceState) -> dict[str, Any]:
     """
+    Pause execution and save a checkpoint until a human submits a
+    decision, feedback, or corrections through the API.
 
+    The API must resume this graph using Command(resume=payload) and
+    the same configurable thread_id used to start the invoice.
+    """
+    review_payload = {
+        "invoice_id": state.get("invoice_id"),
+        "validation_status": state.get("validation_status"),
+        "recommendation": state.get("recommendation"),
+        "data_validation_passed": state.get("data_validation_passed"),
+        "business_validation_passed": state.get(
+            "business_validation_passed"
+        ),
+        "data_validation_errors": state.get("data_validation_errors", []),
+        "business_validation_errors": state.get(
+            "business_validation_errors", []
+        ),
+        "missing_fields": state.get("missing_fields", []),
+        "missing_erp_records": state.get("missing_erp_records", []),
+        "discrepancies": state.get("discrepancies", []),
+        "human_feedback": state.get("human_feedback", []),
+        "human_corrections": state.get("human_corrections", {}),
+    }
+
+    human_response = interrupt(review_payload)
+
+    if not isinstance(human_response, dict):
+        return {
+            "processing_status": "human_review_invalid_response",
+            "errors": [
+                "Human review response must be a JSON object."
+            ],
+            "human_review_required": True,
+        }
+
+    corrections = human_response.get("corrections") or {}
+    feedback = human_response.get("feedback")
+    decision = human_response.get("decision")
+
+    if not isinstance(corrections, dict):
+        return {
+            "processing_status": "human_review_invalid_response",
+            "errors": ["Human corrections must be a JSON object."],
+            "human_review_required": True,
+        }
+
+    existing_corrections = dict(state.get("human_corrections") or {})
+    existing_corrections.update(corrections)
+
+    existing_feedback = state.get("human_feedback") or []
+
+    if isinstance(existing_feedback, dict):
+        existing_feedback = [existing_feedback]
+    else:
+        existing_feedback = list(existing_feedback)
+
+    if feedback:
+        existing_feedback.append(
+            {
+                "feedback": str(feedback),
+                "decision": decision,
+            }
+        )
+
+    normalized_decision = (
+        str(decision).strip().lower()
+        if decision is not None
+        else ""
+    )
+
+    if normalized_decision in {"reject", "rejected"}:
+        return {
+            "human_decision": "rejected",
+            "human_feedback": existing_feedback,
+            "human_corrections": existing_corrections,
+            "human_review_required": False,
+            "human_review_action": "finish",
+            "processing_status": "human_review_rejected",
+        }
+
+    if normalized_decision in {"approve", "approved"} and not corrections:
+        # Approval must not bypass failed checks. Route back through
+        # validation and only approve if all checks now pass.
+        return {
+            "human_decision": "approved",
+            "human_feedback": existing_feedback,
+            "human_corrections": existing_corrections,
+            "human_review_required": True,
+            "human_review_action": "revalidate",
+            "processing_status": "human_review_submitted",
+        }
+
+    if normalized_decision not in {
+        "",
+        "correct",
+        "corrected",
+        "revalidate",
+        "approve",
+        "approved",
+    }:
+        return {
+            "human_decision": normalized_decision,
+            "human_feedback": existing_feedback,
+            "human_corrections": existing_corrections,
+            "human_review_required": True,
+            "human_review_action": "finish",
+            "processing_status": "human_review_invalid_decision",
+            "errors": [
+                f"Unsupported human-review decision: {decision}"
+            ],
+        }
+
+    return {
+        "human_decision": normalized_decision or "corrected",
+        "human_feedback": existing_feedback,
+        "human_corrections": existing_corrections,
+        "human_review_required": True,
+        "human_review_action": "revalidate",
+        "force_revalidation": True,
+        "processing_status": "human_review_submitted",
+    }
+
+
+# ---------------------------------------------------------------------
+# RAG indexing
+# ---------------------------------------------------------------------
+
+def rag_indexing_node(state: InvoiceState) -> dict[str, Any]:
+    """
+    Index the final invoice after persistence. RAG failures should not
+    erase or invalidate the saved audit result.
+    """
     try:
         from agent.rag.indexing import index_invoice
 
         result = index_invoice(state)
 
+        if isinstance(result, dict):
+            return {
+                **result,
+                "processing_status": "complete",
+            }
+
         return {
-            **result,
             "processing_status": "complete",
         }
 
     except Exception as exc:
+        warnings = list(state.get("warnings") or [])
+        warnings.append(f"RAG indexing failed: {exc}")
+
         return {
+            "warnings": warnings,
             "processing_status": "complete",
-            "warnings": [
-                *list(state.get("warnings") or []),
-                f"RAG indexing failed: {exc}",
-            ],
         }
 
 
+# ---------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------
+
 def build_invoice_graph():
-    """
-    Build the complete invoice processing graph.
+    builder = StateGraph(InvoiceState)
 
-    Workflow:
+    builder.add_node("monitor", monitor_invoice)
+    builder.add_node("extract", extract_invoice)
+    builder.add_node("translate", translate_invoice)
+    builder.add_node("field_extraction", extract_fields)
+    builder.add_node("data_validation", data_validate)
+    builder.add_node("business_validation", business_validate)
+    builder.add_node("human_review", human_review_pause)
+    builder.add_node("reporting", generate_report)
+    builder.add_node("persistence", persist_invoice)
+    builder.add_node("rag_indexing", rag_indexing_node)
 
-        monitor
-          ↓
-        extraction
-          ↓
-        translation
-          ↓
-        field extraction
-          ↓
-        business validation
-          ↓
-        data validation
-          ↓
-        reporting
-          ↓
-        persistence
-          ↓
-        RAG indexing
-    """
+    builder.add_edge(START, "monitor")
 
-    workflow = StateGraph(InvoiceState)
-
-    workflow.add_node(
+    builder.add_conditional_edges(
         "monitor",
-        monitor_invoice,
-    )
-
-    workflow.add_node(
-        "extraction",
-        extract_invoice,
-    )
-
-    workflow.add_node(
-        "translation",
-        translate_invoice,
-    )
-
-    workflow.add_node(
-        "field_extraction",
-        extract_fields,
-    )
-
-    workflow.add_node(
-        "business_validation",
-        business_validate,
-    )
-
-    workflow.add_node(
-        "data_validation",
-        data_validate,
-    )
-
-    workflow.add_node(
-        "reporting",
-        generate_report,
-    )
-
-    workflow.add_node(
-        "persistence",
-        persist_invoice,
-    )
-
-    workflow.add_node(
-        "rag_indexing",
-        _rag_indexing,
-    )
-
-    workflow.add_edge(
-        START,
-        "monitor",
-    )
-
-    workflow.add_conditional_edges(
-        "monitor",
-        _should_continue_after_monitor,
+        route_after_monitor,
         {
-            "extraction": "extraction",
-            END: END,
+            "end": END,
+            "extract": "extract",
         },
     )
 
-    workflow.add_conditional_edges(
-        "extraction",
-        _should_continue_after_extraction,
+    builder.add_conditional_edges(
+        "extract",
+        route_after_extraction,
         {
-            "translation": "translation",
-            END: END,
+            "end": END,
+            "translate": "translate",
         },
     )
 
-    workflow.add_conditional_edges(
-        "translation",
-        _should_continue_after_translation,
+    builder.add_conditional_edges(
+        "translate",
+        route_after_translation,
         {
+            "end": END,
             "field_extraction": "field_extraction",
-            END: END,
         },
     )
 
-    workflow.add_edge(
-        "field_extraction",
-        "business_validation",
-    )
+    builder.add_edge("field_extraction", "data_validation")
 
-    workflow.add_edge(
-        "business_validation",
+    builder.add_conditional_edges(
         "data_validation",
-    )
-
-    workflow.add_edge(
-        "data_validation",
-        "reporting",
-    )
-
-    workflow.add_edge(
-        "reporting",
-        "persistence",
-    )
-
-    workflow.add_conditional_edges(
-        "persistence",
-        _should_continue_after_persistence,
+        route_after_data_validation,
         {
-            "rag_indexing": "rag_indexing",
-            END: END,
+            "end": END,
+            "business_validation": "business_validation",
         },
     )
 
-    workflow.add_edge(
-        "rag_indexing",
-        END,
+    builder.add_conditional_edges(
+        "business_validation",
+        route_after_business_validation,
+        {
+            "end": END,
+            "human_review": "human_review",
+            "reporting": "reporting",
+        },
     )
 
-    return workflow.compile()
+    builder.add_conditional_edges(
+        "human_review",
+        route_after_human_review,
+        {
+            "data_validation": "data_validation",
+            "reporting": "reporting",
+        },
+    )
+
+    builder.add_conditional_edges(
+        "reporting",
+        route_after_reporting,
+        {
+            "end": END,
+            "persistence": "persistence",
+        },
+    )
+
+    builder.add_conditional_edges(
+        "persistence",
+        route_after_persistence,
+        {
+            "end": END,
+            "rag_indexing": "rag_indexing",
+        },
+    )
+
+    builder.add_edge("rag_indexing", END)
+
+    return builder.compile(checkpointer=build_checkpointer())
 
 
 invoice_graph = build_invoice_graph()
 
 
-def process_invoice(
-    state: dict[str, Any],
+# ---------------------------------------------------------------------
+# Public invocation helpers
+# ---------------------------------------------------------------------
+
+def _thread_config(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Use a stable thread identifier so a pending invoice can be resumed.
+    """
+    thread_id = (
+        state.get("thread_id")
+        or state.get("invoice_id")
+    )
+
+    if not thread_id:
+        raise ValueError(
+            "thread_id or invoice_id is required for graph execution."
+        )
+
+    return {
+        "configurable": {
+            "thread_id": str(thread_id),
+        }
+    }
+
+
+def process_invoice(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Start or invoke the invoice workflow.
+
+    To resume an interrupted workflow, use resume_invoice() with the
+    same invoice_id/thread_id rather than calling this function again.
+    """
+    return invoice_graph.invoke(
+        state,
+        config=_thread_config(state),
+    )
+
+
+def resume_invoice(
+    invoice_id: str,
+    response: dict[str, Any],
+    *,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Execute invoice processing synchronously.
+    Resume a checkpointed invoice after human review.
+
+    `response` is passed to the pending interrupt. The caller must first
+    verify that the requester is authorized to submit this decision.
     """
+    if not isinstance(response, dict):
+        raise ValueError("Human review response must be a JSON object.")
+
+    resolved_thread_id = thread_id or invoice_id
 
     return invoice_graph.invoke(
-        state
+        Command(resume=response),
+        config={
+            "configurable": {
+                "thread_id": str(resolved_thread_id),
+            }
+        },
     )

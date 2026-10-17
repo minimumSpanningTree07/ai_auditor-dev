@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-import shutil
+import asyncio
+import logging
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-import asyncio
+
+
+import uuid
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
+logger = logging.getLogger(__name__)
+
 
 from agent.watcher import InvoiceWatcher
 from agent.config import settings
@@ -15,8 +23,11 @@ from agent.graph import process_invoice
 from agent.services.database import db
 from agent.services.erp_client import erp_client
 from agent.services.cache import cache
-from agent.watcher import start_watcher, stop_watcher
 
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 app = FastAPI(
@@ -24,10 +35,15 @@ app = FastAPI(
     version="1.0.0",
 )
 
-INCOMING_DIR = "/app/data/incoming"
+INCOMING_DIR = Path("/app/data/incoming")
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".png", ".jpg",
+    ".jpeg", ".tiff", ".tif",
+}
 
-watcher = InvoiceWatcher(INCOMING_DIR)
-watcher_task = None
+watcher = InvoiceWatcher(directory=INCOMING_DIR)
+watcher_task: asyncio.Task | None = None
+
 
 class RevalidationRequest(BaseModel):
     corrections: dict[str, Any] = Field(default_factory=dict)
@@ -38,22 +54,26 @@ class RevalidationRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     global watcher_task
-    watcher_task = asyncio.create_task(
-        watcher.run()
-    )
+    INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    watcher_task = asyncio.create_task(watcher.run())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global watcher_task
 
-    if watcher_task:
+    if watcher_task is not None:
         watcher_task.cancel()
-
         try:
             await watcher_task
         except asyncio.CancelledError:
             pass
+        finally:
+            watcher_task = None
+
+
+
+
 
 
 @app.get("/health")
@@ -155,58 +175,83 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
-@app.post("/api/invoices/upload")
+@app.post("/api/invoices/upload", status_code=202)
 async def upload_invoice(file: UploadFile = File(...)):
-    filename = Path(file.filename or "").name
+    """Save an invoice for asynchronous processing."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
 
-    if not filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is required",
-        )
-
-    extension = Path(filename).suffix.lower()
-
+    extension = Path(file.filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported file type. "
-                "Supported: PDF, DOCX, PNG, JPG, JPEG, TIFF"
-            ),
+            status_code=415,
+            detail=f"Unsupported file type: {extension or 'unknown'}",
         )
 
-    INCOMING_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    destination: Path | None = None
 
-    destination = INCOMING_DIR / filename
+    try:
+        INCOMING_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Avoid overwriting an existing invoice file.
-    if destination.exists():
+        safe_name = f"{uuid.uuid4().hex}{extension}"
+        destination = INCOMING_DIR / safe_name
+        size = 0
+
+        with destination.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File exceeds the 25 MB upload limit.",
+                    )
+
+                output.write(chunk)
+
+        if size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is empty.",
+            )
+
+        logger.info(
+            "Invoice uploaded: original=%s stored=%s bytes=%s",
+            file.filename,
+            safe_name,
+            size,
+        )
+
+        # InvoiceWatcher is responsible for processing files in this directory.
+        return {
+            "status": "queued",
+            "filename": file.filename,
+            "stored_filename": safe_name,
+            "size_bytes": size,
+            "message": "Upload saved; awaiting invoice processing.",
+        }
+
+    except HTTPException:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        raise
+
+    except Exception:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+
+        logger.exception("Invoice upload failed for %r", file.filename)
         raise HTTPException(
-            status_code=409,
-            detail=f"File already exists: {filename}",
+            status_code=500,
+            detail="Upload failed. Check the API server logs.",
         )
 
-    content = await file.read()
+    finally:
+        await file.close()
 
-    if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty",
-        )
-
-    destination.write_bytes(content)
-
-    return {
-        "success": True,
-        "message": "Invoice uploaded successfully",
-        "file_name": filename,
-        "path": str(destination),
-        "status": "queued",
-    }
 
 
 @app.post("/api/invoices/{invoice_id}/revalidate")

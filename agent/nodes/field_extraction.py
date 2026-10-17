@@ -1,498 +1,569 @@
+
 from __future__ import annotations
 
+import json
 import re
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
+
+from litellm import completion
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from agent.config import settings
 
 
-MONTHS = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "sept": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
+# ---------------------------------------------------------------------
+# Structured extraction models
+# ---------------------------------------------------------------------
+
+class InvoiceLine(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    item_code: str | None = None
+    description: str | None = None
+    quantity: Decimal | None = None
+    unit_of_measure: str | None = None
+    unit_price: Decimal | None = None
+    line_total: Decimal | None = None
+    currency: str | None = None
+
+
+class ExtractedInvoice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    document_type: Literal[
+        "invoice",
+        "debit_note",
+        "credit_note",
+        "unknown",
+    ] = "unknown"
+
+    vendor_name: str | None = None
+    vendor_address: str | None = None
+    invoice_number: str | None = None
+    invoice_date: date | None = None
+    po_number: str | None = None
+    currency: str | None = None
+
+    line_items: list[InvoiceLine] = Field(default_factory=list)
+
+    subtotal: Decimal | None = None
+    tax_rate_percent: Decimal | None = None
+    tax_amount: Decimal | None = None
+    total_amount: Decimal | None = None
+
+    original_text: str = ""
+    translated_text: str = ""
+
+    missing_fields: list[str] = Field(default_factory=list)
+    review_reasons: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "vendor_name",
+        "vendor_address",
+        "invoice_number",
+        "po_number",
+        mode="before",
+    )
+    @classmethod
+    def clean_text_fields(cls, value: Any) -> Any:
+        if value is None:
+            return None
+
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def clean_currency(cls, value: Any) -> Any:
+        if value is None:
+            return None
+
+        cleaned = str(value).strip().upper()
+        return cleaned or None
+
+
+FIELD_EXTRACTION_PROMPT = """
+Extract structured information from a supplier invoice, debit note,
+or credit note.
+
+Use the original OCR text and translated text together. The original
+text is the source evidence. The translated text may help interpret
+the original, but must not override identifiers, amounts, dates,
+quantities, or product codes that are clearly present in the original.
+
+Return one valid JSON object only, with these fields:
+
+{
+  "document_type": "invoice | debit_note | credit_note | unknown",
+  "vendor_name": null,
+  "vendor_address": null,
+  "invoice_number": null,
+  "invoice_date": null,
+  "po_number": null,
+  "currency": null,
+  "line_items": [
+    {
+      "item_code": null,
+      "description": null,
+      "quantity": null,
+      "unit_of_measure": null,
+      "unit_price": null,
+      "line_total": null,
+      "currency": null
+    }
+  ],
+  "subtotal": null,
+  "tax_rate_percent": null,
+  "tax_amount": null,
+  "total_amount": null,
+  "missing_fields": [],
+  "review_reasons": []
 }
 
+Rules:
+- Do not invent missing values. Use null when a value cannot be
+  determined from the document.
+- Keep invoice numbers, PO numbers, and item codes exactly as printed,
+  apart from trimming surrounding whitespace.
+- Use ISO format YYYY-MM-DD for invoice_date when unambiguous.
+- Return numeric values as JSON numbers or numeric strings without
+  currency symbols or thousands separators.
+- Do not confuse subtotal, tax amount, and total amount.
+- tax_rate_percent is the percentage value, for example 18 for 18%.
+- Each line item should represent one invoice line.
+- Preserve negative values and signs when present.
+- Do not infer that a vendor, PO, or SKU exists in the ERP.
+- Add uncertain or conflicting information to review_reasons.
+- Include important missing fields in missing_fields.
+- Do not include markdown fences or explanatory text.
+"""
 
-def _lines(text: str) -> list[str]:
-    return [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
 
+# ---------------------------------------------------------------------
+# Extraction helpers
+# ---------------------------------------------------------------------
 
-def _parse_decimal(value: str | None) -> float | None:
-    if not value:
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
         return None
 
-    cleaned = value.strip()
-    cleaned = re.sub(r"[^\d,.\-]", "", cleaned)
-
-    if not cleaned:
-        return None
-
-    # Handle formats such as 1,470.50 and 1.470,50.
-    if "," in cleaned and "." in cleaned:
-        if cleaned.rfind(",") > cleaned.rfind("."):
-            cleaned = cleaned.replace(".", "")
-            cleaned = cleaned.replace(",", ".")
-        else:
-            cleaned = cleaned.replace(",", "")
-
-    elif "," in cleaned:
-        parts = cleaned.split(",")
-
-        if len(parts[-1]) == 2:
-            cleaned = "".join(parts[:-1]) + "." + parts[-1]
-        else:
-            cleaned = cleaned.replace(",", "")
+    if isinstance(value, Decimal):
+        return value
 
     try:
-        return float(Decimal(cleaned))
-    except (InvalidOperation, ValueError):
+        cleaned = str(value).strip().replace(",", "")
+        cleaned = re.sub(r"^[^\d+\-.]+", "", cleaned)
+        cleaned = re.sub(r"[^\d.\-+]+$", "", cleaned)
+
+        if not cleaned:
+            return None
+
+        return Decimal(cleaned)
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
-def _parse_date(value: str | None) -> str | None:
-    if not value:
+def normalize_sku(value: Any) -> str | None:
+    if value is None:
         return None
 
-    value = value.strip()
-
-    # YYYY-MM-DD / YYYY/MM/DD
-    match = re.fullmatch(
-        r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
-        value,
-    )
-
-    if match:
-        try:
-            return date(
-                int(match.group(1)),
-                int(match.group(2)),
-                int(match.group(3)),
-            ).isoformat()
-        except ValueError:
-            return None
-
-    # DD-MM-YYYY / DD/MM/YYYY
-    match = re.fullmatch(
-        r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})",
-        value,
-    )
-
-    if match:
-        try:
-            return date(
-                int(match.group(3)),
-                int(match.group(2)),
-                int(match.group(1)),
-            ).isoformat()
-        except ValueError:
-            return None
-
-    # 14 March 2025 / 14 Mar 2025
-    match = re.fullmatch(
-        r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
-        value,
-    )
-
-    if match:
-        month = MONTHS.get(
-            match.group(2).lower()
-        )
-
-        if month:
-            try:
-                return date(
-                    int(match.group(3)),
-                    month,
-                    int(match.group(1)),
-                ).isoformat()
-            except ValueError:
-                return None
-
-    # March 14, 2025
-    match = re.fullmatch(
-        r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})",
-        value,
-    )
-
-    if match:
-        month = MONTHS.get(
-            match.group(1).lower()
-        )
-
-        if month:
-            try:
-                return date(
-                    int(match.group(3)),
-                    month,
-                    int(match.group(2)),
-                ).isoformat()
-            except ValueError:
-                return None
-
-    return None
+    normalized = re.sub(r"\s+", "", str(value)).strip()
+    return normalized or None
 
 
-def _find_value(
-    text: str,
-    patterns: list[str],
-) -> str | None:
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE | re.MULTILINE,
-        )
+def _parse_model_response(content: Any) -> dict[str, Any]:
+    if isinstance(content, dict):
+        return content
 
-        if match:
-            value = match.group(1).strip()
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("The LLM returned an empty extraction response.")
 
-            if value:
-                return value
+    text = content.strip()
 
-    return None
+    # Accommodate providers that return JSON inside markdown fences.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
 
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"The LLM response was not valid JSON: {exc}"
+        ) from exc
 
-def _extract_vendor(
-    lines: list[str],
-) -> str | None:
-    ignored = {
-        "invoice",
-        "invoice no",
-        "invoice number",
-        "invoice date",
-        "date",
-        "po reference",
-        "purchase order",
-        "subtotal",
-        "tax",
-        "total",
-        "description",
-        "quantity",
-        "qty",
-        "unit price",
-        "amount",
-    }
+    if not isinstance(parsed, dict):
+        raise ValueError("The LLM response must be a JSON object.")
 
-    for line in lines[:8]:
-        normalized = re.sub(
-            r"[:#\-]+$",
-            "",
-            line,
-        ).strip()
-
-        if not normalized:
-            continue
-
-        lower = normalized.lower()
-
-        if any(
-            lower.startswith(item)
-            for item in ignored
-        ):
-            continue
-
-        if re.search(
-            r"\b(invoice|date|total|tax|subtotal|po|purchase order)\b",
-            lower,
-        ):
-            continue
-
-        if re.search(
-            r"\d{2,}",
-            normalized,
-        ):
-            continue
-
-        if len(normalized) >= 3:
-            return normalized
-
-    return None
+    return parsed
 
 
-def _extract_currency(
-    text: str,
-) -> str | None:
-    currency_patterns = [
-        (r"\bUSD\b", "USD"),
-        (r"\bEUR\b", "EUR"),
-        (r"\bGBP\b", "GBP"),
-        (r"\bINR\b", "INR"),
-        (r"\bCAD\b", "CAD"),
-        (r"\bAUD\b", "AUD"),
-        (r"\bJPY\b", "JPY"),
-        (r"\$", "USD"),
-        (r"€", "EUR"),
-        (r"£", "GBP"),
-        (r"₹", "INR"),
-    ]
-
-    for pattern, currency in currency_patterns:
-        if re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        ):
-            return currency
-
-    return None
-
-
-def _extract_line_items(
-    text: str,
-) -> list[dict[str, Any]]:
+def extract_invoice_fields(
+    original_text: str,
+    translated_text: str,
+) -> ExtractedInvoice:
     """
-    Parse common invoice table formats.
+    Extract invoice fields using the configured LiteLLM model.
 
-    Expected examples:
-
-        Widget A    2    100.00    200.00
-        SKU-001     2    100.00    200.00
-
-    Header lines and summary lines are ignored.
+    This function performs extraction only. ERP lookups and validation
+    are handled by their respective workflow nodes.
     """
+    original_text = original_text or ""
+    translated_text = translated_text or original_text
 
-    items: list[dict[str, Any]] = []
+    if not original_text.strip() and not translated_text.strip():
+        raise ValueError("No invoice text is available for field extraction.")
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    response = completion(
+        model=settings.llm_model,
+        messages=[
+            {
+                "role": "system",
+                "content": FIELD_EXTRACTION_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "ORIGINAL OCR TEXT:\n"
+                    f"{original_text}\n\n"
+                    "TRANSLATED TEXT:\n"
+                    f"{translated_text}"
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=settings.llm_max_tokens,
+    )
 
-        if not line:
-            continue
+    content = response.choices[0].message.content
+    data = _parse_model_response(content)
 
-        lower = line.lower()
+    data["original_text"] = original_text
+    data["translated_text"] = translated_text
 
-        if any(
-            keyword in lower
-            for keyword in (
-                "description",
-                "subtotal",
-                "tax",
-                "total",
-                "invoice no",
-                "invoice date",
-                "po reference",
-                "purchase order",
-            )
-        ):
-            continue
+    invoice = ExtractedInvoice.model_validate(data)
+    return finalize_extraction(
+        invoice,
+        original_text=original_text,
+        translated_text=translated_text,
+    )
 
-        match = re.match(
-            r"^(?P<description>.+?)"
-            r"\s+(?P<quantity>\d+(?:[.,]\d+)?)"
-            r"\s+(?P<unit_price>[$€£₹]?\s*[\d,]+(?:\.\d+)?)"
-            r"\s+(?P<amount>[$€£₹]?\s*[\d,]+(?:\.\d+)?)$",
-            line,
-        )
 
-        if not match:
-            continue
+# ---------------------------------------------------------------------
+# Arithmetic consistency checks
+# ---------------------------------------------------------------------
 
-        description = match.group(
-            "description"
-        ).strip()
+def check_invoice_consistency(
+    invoice: ExtractedInvoice,
+    tolerance: Decimal = Decimal("0.02"),
+) -> list[str]:
+    issues: list[str] = []
+    line_totals: list[Decimal] = []
 
-        quantity = _parse_decimal(
-            match.group("quantity")
-        )
+    for index, item in enumerate(invoice.line_items, start=1):
+        if item.quantity is not None and item.quantity < 0:
+            issues.append(f"Line {index}: quantity is negative.")
 
-        unit_price = _parse_decimal(
-            match.group("unit_price")
-        )
+        if item.unit_price is not None and item.unit_price < 0:
+            issues.append(f"Line {index}: unit price is negative.")
 
-        amount = _parse_decimal(
-            match.group("amount")
-        )
+        if item.line_total is not None and item.line_total < 0:
+            issues.append(f"Line {index}: line total is negative.")
 
         if (
-            not description
-            or quantity is None
-            or unit_price is None
-            or amount is None
+            item.quantity is not None
+            and item.unit_price is not None
+            and item.line_total is not None
         ):
-            continue
+            calculated = item.quantity * item.unit_price
 
-        items.append(
-            {
-                "description": description,
-                "sku": None,
-                "quantity": quantity,
-                "unit_price": unit_price,
-                "amount": amount,
-                "line_total": amount,
-            }
-        )
+            if abs(calculated - item.line_total) > tolerance:
+                issues.append(
+                    f"Line {index}: quantity × unit price "
+                    f"({calculated}) does not match line total "
+                    f"({item.line_total})."
+                )
 
-    return items
+        if item.line_total is not None:
+            line_totals.append(item.line_total)
 
+    if invoice.subtotal is not None and len(line_totals) == len(
+        invoice.line_items
+    ) and line_totals:
+        calculated_subtotal = sum(line_totals, Decimal("0"))
 
-def extract_fields(
-    state: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Extract structured invoice fields from translated text.
-
-    Original raw text remains untouched.
-    """
-
-    text = (
-        state.get("translated_text")
-        or state.get("raw_extracted_text")
-        or ""
-    )
-
-    if not text:
-        return {
-            "processing_status": "failed",
-            "errors": [
-                "No invoice text available for field extraction."
-            ],
-        }
-
-    lines = _lines(text)
-
-    invoice_number = _find_value(
-        text,
-        [
-            r"^\s*invoice\s*(?:no|number|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9./_-]*)\s*$",
-            r"\binvoice\s*(?:no|number|#)\s*[:\-]?\s*([A-Z0-9][A-Z0-9./_-]*)",
-        ],
-    )
-
-    po_number = _find_value(
-        text,
-        [
-            r"^\s*(?:po|purchase\s+order)"
-            r"(?:\s*(?:no|number|reference|ref|#))?"
-            r"\s*[:\-]?\s*([A-Z0-9][A-Z0-9./_-]*)\s*$",
-            r"\bPO\s*(?:Reference|Ref|No|Number|#)?"
-            r"\s*[:\-]?\s*([A-Z0-9][A-Z0-9./_-]*)",
-        ],
-    )
-
-    date_value = _find_value(
-        text,
-        [
-            r"^\s*(?:invoice\s+)?date\s*[:\-]?\s*"
-            r"([0-9]{1,4}[-/.][0-9]{1,2}[-/.][0-9]{1,4})\s*$",
-            r"^\s*(?:invoice\s+)?date\s*[:\-]?\s*"
-            r"([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4})\s*$",
-            r"^\s*(?:invoice\s+)?date\s*[:\-]?\s*"
-            r"([A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4})\s*$",
-        ],
-    )
-
-    subtotal_raw = _find_value(
-        text,
-        [
-            r"^\s*subtotal\s*[:\-]?\s*"
-            r"([$€£₹]?\s*[\d,]+(?:\.\d+)?)\s*$",
-        ],
-    )
-
-    tax_raw = _find_value(
-        text,
-        [
-            r"^\s*(?:tax|vat|gst)\s*[:\-]?\s*"
-            r"([$€£₹]?\s*[\d,]+(?:\.\d+)?)\s*$",
-        ],
-    )
-
-    total_raw = _find_value(
-        text,
-        [
-            r"^\s*(?:grand\s+)?total\s*[:\-]?\s*"
-            r"([$€£₹]?\s*[\d,]+(?:\.\d+)?)\s*$",
-        ],
-    )
-
-    tax_rate_raw = _find_value(
-        text,
-        [
-            r"(?:tax|vat|gst)\s*(?:rate)?\s*[:\-]?\s*"
-            r"(\d+(?:\.\d+)?)\s*%",
-        ],
-    )
-
-    tax_amount = _parse_decimal(tax_raw)
-    subtotal_amount = _parse_decimal(subtotal_raw)
-    total_amount = _parse_decimal(total_raw)
-
-    tax_rate = _parse_decimal(tax_rate_raw)
+        if abs(calculated_subtotal - invoice.subtotal) > tolerance:
+            issues.append(
+                f"Sum of line totals ({calculated_subtotal}) does not "
+                f"match subtotal ({invoice.subtotal})."
+            )
 
     if (
-        tax_rate is None
-        and subtotal_amount not in (None, 0)
-        and tax_amount is not None
+        invoice.subtotal is not None
+        and invoice.tax_amount is not None
+        and invoice.total_amount is not None
     ):
-        tax_rate = round(
-            (tax_amount / subtotal_amount) * 100,
-            4,
+        calculated_total = invoice.subtotal + invoice.tax_amount
+
+        if abs(calculated_total - invoice.total_amount) > tolerance:
+            issues.append(
+                f"Subtotal plus tax ({calculated_total}) does not "
+                f"match invoice total ({invoice.total_amount})."
+            )
+
+    return issues
+
+
+def finalize_extraction(
+    data: ExtractedInvoice | dict[str, Any],
+    original_text: str = "",
+    translated_text: str = "",
+) -> ExtractedInvoice:
+    if isinstance(data, ExtractedInvoice):
+        invoice = data
+    else:
+        invoice = ExtractedInvoice.model_validate(data)
+
+    invoice.original_text = original_text or invoice.original_text
+    invoice.translated_text = translated_text or invoice.translated_text
+
+    required_values = {
+        "vendor_name": invoice.vendor_name,
+        "invoice_number": invoice.invoice_number,
+        "invoice_date": invoice.invoice_date,
+        "po_number": invoice.po_number,
+        "currency": invoice.currency,
+        "line_items": invoice.line_items,
+        "total_amount": invoice.total_amount,
+    }
+
+    missing = [
+        field
+        for field, value in required_values.items()
+        if value is None or value == "" or value == []
+    ]
+
+    # Preserve model-supplied missing fields while removing duplicates.
+    invoice.missing_fields = list(
+        dict.fromkeys(invoice.missing_fields + missing)
+    )
+
+    if not invoice.invoice_number:
+        invoice.review_reasons.append("Invoice number is missing.")
+
+    if not invoice.po_number:
+        invoice.review_reasons.append("Purchase order number is missing.")
+
+    if not invoice.line_items:
+        invoice.review_reasons.append("No invoice line items were extracted.")
+
+    arithmetic_issues = check_invoice_consistency(invoice)
+    invoice.review_reasons = list(
+        dict.fromkeys(invoice.review_reasons + arithmetic_issues)
+    )
+
+    return invoice
+
+
+# ---------------------------------------------------------------------
+# Mapping into the existing workflow state
+# ---------------------------------------------------------------------
+
+def _line_items_for_state(
+    invoice: ExtractedInvoice,
+) -> list[dict[str, Any]]:
+    """
+    Map extracted line items to the dictionary structure used by
+    business validation and persistence.
+    """
+    result: list[dict[str, Any]] = []
+
+    for item in invoice.line_items:
+        row = item.model_dump(mode="json")
+
+        # Existing validation/persistence code accepts sku, sku_code,
+        # or product_code. Preserve item_code as well.
+        row["sku"] = normalize_sku(item.item_code)
+        row["sku_code"] = row["sku"]
+        row["product_code"] = row["sku"]
+
+        result.append(row)
+
+    return result
+
+
+def _apply_corrections(
+    extracted_values: dict[str, Any],
+    corrections: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Apply human corrections to effective values only. The immutable
+    extracted_* values are never modified here.
+    """
+    aliases = {
+        "extracted_invoice_number": "invoice_number",
+        "extracted_vendor_name": "vendor_name",
+        "extracted_po_number": "po_number",
+        "extracted_invoice_date": "invoice_date",
+        "extracted_currency": "currency",
+        "extracted_subtotal_amount": "subtotal_amount",
+        "extracted_tax_amount": "tax_amount",
+        "extracted_tax_rate": "tax_rate",
+        "extracted_total_amount": "total_amount",
+        "extracted_line_items": "line_items",
+    }
+
+    effective = dict(extracted_values)
+
+    for key, value in corrections.items():
+        target = aliases.get(key, key)
+
+        if target in effective and value is not None:
+            effective[target] = value
+
+    return effective
+
+
+def extract_fields(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    LangGraph node: extract structured fields and map them into the
+    existing InvoiceState naming conventions.
+
+    The extracted_* fields remain the original model output. Effective
+    values are separate and may incorporate previously submitted human
+    corrections.
+    """
+    original_text = state.get("raw_extracted_text") or ""
+    translated_text = (
+        state.get("translated_text")
+        or original_text
+    )
+
+    errors = list(state.get("errors") or [])
+    warnings = list(state.get("warnings") or [])
+
+    try:
+        invoice = extract_invoice_fields(
+            original_text=original_text,
+            translated_text=translated_text,
         )
 
-    line_items = _extract_line_items(text)
+        line_items = _line_items_for_state(invoice)
 
-    errors: list[str] = []
+        extracted_values: dict[str, Any] = {
+            "invoice_number": invoice.invoice_number,
+            "vendor_name": invoice.vendor_name,
+            "po_number": invoice.po_number,
+            "invoice_date": (
+                invoice.invoice_date.isoformat()
+                if invoice.invoice_date
+                else None
+            ),
+            "currency": invoice.currency,
+            "subtotal_amount": (
+                str(invoice.subtotal)
+                if invoice.subtotal is not None
+                else None
+            ),
+            "tax_amount": (
+                str(invoice.tax_amount)
+                if invoice.tax_amount is not None
+                else None
+            ),
+            "tax_rate": (
+                str(invoice.tax_rate_percent)
+                if invoice.tax_rate_percent is not None
+                else None
+            ),
+            "total_amount": (
+                str(invoice.total_amount)
+                if invoice.total_amount is not None
+                else None
+            ),
+            "line_items": line_items,
+        }
 
-    if not invoice_number:
-        errors.append("Invoice number could not be extracted.")
+        # Apply corrections only to the effective values.
+        corrections = state.get("human_corrections") or {}
+        effective = _apply_corrections(extracted_values, corrections)
 
-    if not po_number:
-        errors.append("PO number could not be extracted.")
+        missing_fields = list(invoice.missing_fields)
+        review_reasons = list(invoice.review_reasons)
 
-    if not date_value:
-        errors.append("Invoice date could not be extracted.")
+        if missing_fields:
+            warnings.append(
+                "Extraction is missing fields: "
+                + ", ".join(missing_fields)
+            )
 
-    return {
-        "extracted_invoice_number": invoice_number,
-        "extracted_vendor_name": _extract_vendor(lines),
-        "extracted_po_number": po_number,
-        "extracted_invoice_date": _parse_date(date_value),
-        "extracted_currency": _extract_currency(text),
-        "extracted_subtotal_amount": subtotal_amount,
-        "extracted_tax_amount": tax_amount,
-        "extracted_tax_rate": tax_rate,
-        "extracted_total_amount": total_amount,
-        "extracted_line_items": line_items,
-        "line_items": line_items,
-        "validation_errors": errors,
-        "missing_fields": [
-            field
-            for field, value in {
-                "invoice_number": invoice_number,
-                "vendor_name": _extract_vendor(lines),
-                "po_number": po_number,
-                "invoice_date": _parse_date(date_value),
-                "currency": _extract_currency(text),
-                "subtotal_amount": subtotal_amount,
-                "tax_amount": tax_amount,
-                "total_amount": total_amount,
-            }.items()
-            if value is None
-        ],
-        "processing_status": "field_extraction_complete",
-    }
+        if review_reasons:
+            warnings.extend(review_reasons)
+
+        result: dict[str, Any] = {
+            # Original extraction: persisted as immutable extraction data.
+            "extracted_invoice_number": extracted_values["invoice_number"],
+            "extracted_vendor_name": extracted_values["vendor_name"],
+            "extracted_po_number": extracted_values["po_number"],
+            "extracted_invoice_date": extracted_values["invoice_date"],
+            "extracted_currency": extracted_values["currency"],
+            "extracted_subtotal_amount": extracted_values["subtotal_amount"],
+            "extracted_tax_amount": extracted_values["tax_amount"],
+            "extracted_tax_rate": extracted_values["tax_rate"],
+            "extracted_total_amount": extracted_values["total_amount"],
+            "extracted_line_items": line_items,
+
+            # Existing effective_* fields consumed by validation/persistence.
+            "effective_invoice_number": effective["invoice_number"],
+            "effective_vendor_name": effective["vendor_name"],
+            "effective_po_number": effective["po_number"],
+            "effective_invoice_date": effective["invoice_date"],
+            "effective_currency": effective["currency"],
+            "effective_subtotal_amount": effective["subtotal_amount"],
+            "effective_tax_amount": effective["tax_amount"],
+            "effective_tax_rate": effective["tax_rate"],
+            "effective_total_amount": effective["total_amount"],
+            "effective_line_items": effective["line_items"],
+
+            # Canonical fields already declared in InvoiceState.
+            "invoice_number": effective["invoice_number"],
+            "vendor_name": effective["vendor_name"],
+            "po_number": effective["po_number"],
+            "invoice_date": effective["invoice_date"],
+            "currency": effective["currency"],
+            "subtotal_amount": effective["subtotal_amount"],
+            "tax_amount": effective["tax_amount"],
+            "tax_rate": effective["tax_rate"],
+            "total_amount": effective["total_amount"],
+            "line_items": effective["line_items"],
+
+            "document_type": invoice.document_type,
+            "missing_fields": missing_fields,
+            "field_extraction_review_reasons": review_reasons,
+            "field_extraction_passed": not missing_fields,
+            "human_review_required": bool(
+                state.get("human_review_required")
+                or missing_fields
+                or review_reasons
+            ),
+            "warnings": list(dict.fromkeys(warnings)),
+            "processing_status": "field_extraction_complete",
+        }
+
+        # Preserve existing errors instead of replacing the whole list.
+        if errors:
+            result["errors"] = errors
+
+        return result
+
+    except Exception as exc:
+        errors.append(f"Field extraction failed: {exc}")
+
+        return {
+            "field_extraction_passed": False,
+            "human_review_required": True,
+            "errors": errors,
+            "processing_status": "failed",
+        }

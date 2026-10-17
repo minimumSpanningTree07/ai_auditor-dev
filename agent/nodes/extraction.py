@@ -18,6 +18,7 @@ SUPPORTED_TEXT_EXTENSIONS = {
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {
     ".pdf",
+    ".docx",
     ".png",
     ".jpg",
     ".jpeg",
@@ -83,6 +84,21 @@ def _extract_ocr_text(path: Path) -> str:
     )
 
 
+
+def _extract_docx_text(path: Path) -> str:
+    try:
+        from docx import Document
+    except ImportError as exc:
+        raise RuntimeError("python-docx is required for DOCX extraction.") from exc
+    document = Document(str(path))
+    parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return _clean_text("\n".join(parts))
+
 def _extract_document_text(path: Path) -> tuple[str, str]:
     """
     Return extracted text and extraction method.
@@ -92,6 +108,10 @@ def _extract_document_text(path: Path) -> tuple[str, str]:
 
     if suffix in SUPPORTED_TEXT_EXTENSIONS:
         return _extract_text_file(path), "text"
+
+    if suffix == ".docx":
+        text = _extract_docx_text(path)
+        return text, "docx"
 
     if suffix == ".pdf":
         text = _extract_pdf_text(path)

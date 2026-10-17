@@ -8,10 +8,12 @@ from agent.services.checksum import (
     ChecksumError,
     get_file_metadata,
 )
+from agent.services.database import db, DatabaseErrorHandler
 
 
 SUPPORTED_EXTENSIONS = {
     ".pdf",
+    ".docx",
     ".png",
     ".jpg",
     ".jpeg",
@@ -73,28 +75,34 @@ def monitor_invoice(state: dict[str, Any]) -> dict[str, Any]:
 
     checksum = str(metadata["file_checksum"])
 
-    # Existing checksum can be supplied by the watcher/API.
-    existing_checksum = state.get("file_checksum")
+    # Explicit revalidation is allowed to reuse the original file checksum.
+    force_revalidation = bool(state.get("force_revalidation", False))
+    duplicate_record = None
+    if not force_revalidation:
+        try:
+            duplicate_record = db.fetch_one(
+                "SELECT invoice_id FROM audit.invoices WHERE file_checksum = %s LIMIT 1",
+                [checksum],
+            )
+        except DatabaseErrorHandler as exc:
+            return {
+                **metadata,
+                "file_path": str(path.resolve()),
+                "file_checksum": checksum,
+                "processing_status": "failed",
+                "errors": [f"Unable to check invoice checksum in audit database: {exc}"],
+            }
 
-    # Explicit revalidation must be allowed even when the file was
-    # previously processed.
-    force_revalidation = bool(
-        state.get("force_revalidation", False)
-    )
-
-    is_duplicate = (
-        bool(existing_checksum)
-        and existing_checksum == checksum
-        and not force_revalidation
-    )
+    # Do not compare state["file_checksum"] with this computed checksum:
+    # the watcher passes the current file's checksum in state, so that
+    # comparison would incorrectly classify every new upload as a duplicate.
+    is_duplicate = bool(duplicate_record) and not force_revalidation
 
     errors = list(state.get("errors") or [])
     warnings = list(state.get("warnings") or [])
 
     if is_duplicate:
-        warnings.append(
-            f"Duplicate invoice detected for checksum {checksum}."
-        )
+        warnings.append(f"Duplicate invoice detected for checksum {checksum}.")
 
     return {
         "file_path": str(path.resolve()),

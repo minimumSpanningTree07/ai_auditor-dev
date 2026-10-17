@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query
@@ -23,11 +24,27 @@ def shutdown() -> None:
 
 @app.get("/health")
 def health() -> dict[str, bool]:
+    healthy = repository.health_check()
     return {
-        "status": repository.health_check(),
+        "status": healthy,
     }
 
 
+# Required API: retrieve a vendor by its ERP vendor ID.
+@app.get("/vendor/{vendor_id}", response_model=Vendor)
+def get_vendor(vendor_id: str) -> Vendor:
+    vendor = repository.get_vendor(vendor_id)
+
+    if not vendor:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Vendor not found: {vendor_id}",
+        )
+
+    return vendor
+
+
+# Retain the name-search route for compatibility with existing callers.
 @app.get("/vendor/search", response_model=Vendor)
 def search_vendor(
     name: str = Query(..., min_length=1),
@@ -43,26 +60,21 @@ def search_vendor(
     return vendor
 
 
-@app.get(
-    "/purchase-order/{po_number}",
-    response_model=PurchaseOrder,
-)
-def get_purchase_order(
-    po_number: str,
-) -> PurchaseOrder:
-    purchase_order = repository.get_purchase_order(
-        po_number
-    )
+# Required API: retrieve PO header and line items.
+@app.get("/po/{po_number}", response_model=PurchaseOrder)
+def get_purchase_order(po_number: str) -> PurchaseOrder:
+    purchase_order = repository.get_purchase_order(po_number)
 
     if not purchase_order:
         raise HTTPException(
             status_code=404,
-            detail="Purchase order not found",
+            detail=f"Purchase order not found: {po_number}",
         )
 
     return purchase_order
 
 
+# Required API: retrieve an individual SKU.
 @app.get("/sku/{sku_code}", response_model=SKU)
 def get_sku(sku_code: str) -> SKU:
     sku = repository.get_sku(sku_code)
@@ -70,7 +82,7 @@ def get_sku(sku_code: str) -> SKU:
     if not sku:
         raise HTTPException(
             status_code=404,
-            detail="SKU not found",
+            detail=f"SKU not found: {sku_code}",
         )
 
     return sku

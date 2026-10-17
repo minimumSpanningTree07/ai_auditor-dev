@@ -1,411 +1,589 @@
+
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+import re
 
 from agent.config import settings
 
 
-def _decimal(value: Any) -> Decimal | None:
-    if value is None:
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def _effective(state: dict[str, Any], field: str) -> Any:
+    """
+    Prefer human-corrected effective values, then canonical state values,
+    and finally immutable original extraction values.
+    """
+    effective_value = state.get(f"effective_{field}")
+    if effective_value is not None:
+        return effective_value
+
+    canonical_value = state.get(field)
+    if canonical_value is not None:
+        return canonical_value
+
+    return state.get(f"extracted_{field}")
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
         return None
 
+    if isinstance(value, Decimal):
+        return value
+
     try:
-        return Decimal(str(value))
+        normalized = str(value).strip().replace(",", "")
+        normalized = re.sub(r"^[^\d+\-.]+", "", normalized)
+        normalized = re.sub(r"[^\d.\-+]+$", "", normalized)
+
+        if not normalized:
+            return None
+
+        return Decimal(normalized)
     except (InvalidOperation, ValueError, TypeError):
         return None
 
 
-def _equal(
-    left: Any,
-    right: Any,
-) -> bool:
-    left_value = _decimal(left)
-    right_value = _decimal(right)
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
 
-    if left_value is None or right_value is None:
-        return False
+    return str(value).strip()
 
-    tolerance = Decimal(
-        str(settings.amount_tolerance)
+
+def _parse_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Prefer unambiguous date formats. Do not guess ambiguous
+    # values such as 03/04/2026.
+    formats = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%b-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
     )
 
-    return abs(left_value - right_value) <= tolerance
-
-
-def _valid_date(value: Any) -> bool:
-    if value is None:
-        return False
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
 
     try:
-        date.fromisoformat(str(value))
-        return True
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.date()
     except ValueError:
-        return False
+        return None
 
 
-def _valid_currency(value: Any) -> bool:
-    if value is None:
-        return False
-
-    return str(value).strip().upper() in {
-        "USD",
-        "EUR",
-        "GBP",
-        "INR",
-        "CAD",
-        "AUD",
-        "JPY",
-        "CNY",
-        "CHF",
-        "SGD",
-    }
+def _amount_tolerance() -> Decimal:
+    try:
+        return Decimal(str(settings.amount_tolerance))
+    except (AttributeError, InvalidOperation, TypeError, ValueError):
+        return Decimal("0.02")
 
 
-def _validate_line_totals(
-    line_items: list[dict[str, Any]],
-) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-
-    if not line_items:
-        return False, ["No invoice line items found."]
-
-    for index, item in enumerate(line_items, start=1):
-        quantity = _decimal(
-            item.get("quantity")
-        )
-
-        unit_price = _decimal(
-            item.get("unit_price")
-        )
-
-        line_total = _decimal(
-            item.get("line_total")
-            or item.get("amount")
-            or item.get("total")
-        )
-
-        if quantity is None:
-            errors.append(
-                f"Line {index}: quantity is missing or invalid."
-            )
-            continue
-
-        if unit_price is None:
-            errors.append(
-                f"Line {index}: unit price is missing or invalid."
-            )
-            continue
-
-        if line_total is None:
-            errors.append(
-                f"Line {index}: line total is missing or invalid."
-            )
-            continue
-
-        expected = quantity * unit_price
-
-        tolerance = Decimal(
-            str(settings.amount_tolerance)
-        )
-
-        if abs(expected - line_total) > tolerance:
-            errors.append(
-                f"Line {index}: line total mismatch "
-                f"(expected={expected}, actual={line_total})."
-            )
-
-    return not errors, errors
-
-
-def _validate_subtotal(
-    line_items: list[dict[str, Any]],
-    subtotal: Any,
-) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-
-    subtotal_value = _decimal(subtotal)
-
-    if subtotal_value is None:
-        return False, ["Subtotal is missing or invalid."]
-
-    line_sum = Decimal("0")
-
-    for item in line_items:
-        value = _decimal(
-            item.get("line_total")
-            or item.get("amount")
-            or item.get("total")
-        )
-
-        if value is not None:
-            line_sum += value
-
-    tolerance = Decimal(
-        str(settings.amount_tolerance)
-    )
-
-    if abs(line_sum - subtotal_value) > tolerance:
-        errors.append(
-            f"Subtotal mismatch "
-            f"(line_sum={line_sum}, subtotal={subtotal_value})."
-        )
-
-    return not errors, errors
-
-
-def _validate_tax(
-    subtotal: Any,
-    tax: Any,
-    tax_rate: Any,
-) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-
-    subtotal_value = _decimal(subtotal)
-    tax_value = _decimal(tax)
-    rate_value = _decimal(tax_rate)
-
-    if subtotal_value is None:
-        return False, ["Cannot validate tax without subtotal."]
-
-    if tax_value is None:
-        return False, ["Tax amount is missing or invalid."]
-
-    if rate_value is None:
-        return False, ["Tax rate is missing or invalid."]
-
-    expected_tax = (
-        subtotal_value
-        * rate_value
-        / Decimal("100")
-    )
-
-    tolerance = Decimal(
-        str(settings.amount_tolerance)
-    )
-
-    if abs(expected_tax - tax_value) > tolerance:
-        errors.append(
-            f"Tax mismatch "
-            f"(expected={expected_tax}, tax={tax_value}, "
-            f"rate={rate_value}%)."
-        )
-
-    return not errors, errors
-
-
-def _validate_total(
-    subtotal: Any,
-    tax: Any,
-    total: Any,
-) -> tuple[bool, list[str]]:
-    errors: list[str] = []
-
-    subtotal_value = _decimal(subtotal)
-    tax_value = _decimal(tax)
-    total_value = _decimal(total)
-
-    if subtotal_value is None:
-        return False, ["Cannot validate total without subtotal."]
-
-    if tax_value is None:
-        return False, ["Cannot validate total without tax."]
-
-    if total_value is None:
-        return False, ["Total is missing or invalid."]
-
-    expected_total = (
-        subtotal_value + tax_value
-    )
-
-    tolerance = Decimal(
-        str(settings.amount_tolerance)
-    )
-
-    if abs(expected_total - total_value) > tolerance:
-        errors.append(
-            f"Total mismatch "
-            f"(expected={expected_total}, total={total_value})."
-        )
-
-    return not errors, errors
-
-
-def data_validate(
-    state: dict[str, Any],
-) -> dict[str, Any]:
+def _add_discrepancy(
+    discrepancies: list[dict[str, Any]],
+    *,
+    discrepancy_type: str,
+    message: str,
+    severity: str = "high",
+    details: dict[str, Any] | None = None,
+) -> None:
     """
-    Validate the internal mathematical and structural consistency
-    of extracted invoice data.
-
-    This is independent of ERP/business validation.
+    Keep the existing discrepancy keys consumed by persistence:
+    type, severity, message, details, status.
     """
-
-    invoice_number = (
-        state.get("effective_invoice_number")
-        or state.get("extracted_invoice_number")
+    discrepancies.append(
+        {
+            "type": discrepancy_type,
+            "severity": severity,
+            "message": message,
+            "details": details or {},
+            "status": "open",
+        }
     )
 
-    vendor_name = (
-        state.get("effective_vendor_name")
-        or state.get("extracted_vendor_name")
-    )
 
-    invoice_date = (
-        state.get("effective_invoice_date")
-        or state.get("extracted_invoice_date")
-    )
+# ---------------------------------------------------------------------
+# Data validation
+# ---------------------------------------------------------------------
 
-    currency = (
-        state.get("effective_currency")
-        or state.get("extracted_currency")
-    )
+def data_validate(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate invoice completeness, field formats and arithmetic.
 
-    subtotal = (
-        state.get("effective_subtotal_amount")
-        if state.get("effective_subtotal_amount") is not None
-        else state.get("extracted_subtotal_amount")
-    )
+    This node does not query the ERP. ERP vendor, PO, SKU, quantity and
+    unit-price checks belong in business_validation.py.
 
-    tax = (
-        state.get("effective_tax_amount")
-        if state.get("effective_tax_amount") is not None
-        else state.get("extracted_tax_amount")
-    )
-
-    tax_rate = (
-        state.get("effective_tax_rate")
-        if state.get("effective_tax_rate") is not None
-        else state.get("extracted_tax_rate")
-    )
-
-    total = (
-        state.get("effective_total_amount")
-        if state.get("effective_total_amount") is not None
-        else state.get("extracted_total_amount")
-    )
-
-    line_items = (
-        state.get("effective_line_items")
-        or state.get("extracted_line_items")
-        or state.get("line_items")
-        or []
-    )
-
+    Original extracted_* fields are read-only. This function validates
+    the effective/corrected values and returns validation results for
+    the existing InvoiceState.
+    """
     errors: list[str] = []
     warnings: list[str] = []
+    discrepancies: list[dict[str, Any]] = []
 
-    # ------------------------------------------------------------
+    invoice_number = _effective(state, "invoice_number")
+    vendor_name = _effective(state, "vendor_name")
+    po_number = _effective(state, "po_number")
+    invoice_date_value = _effective(state, "invoice_date")
+    currency = _effective(state, "currency")
+    subtotal_value = _effective(state, "subtotal_amount")
+    tax_value = _effective(state, "tax_amount")
+    tax_rate_value = _effective(state, "tax_rate")
+    total_value = _effective(state, "total_amount")
+    line_items = _effective(state, "line_items") or []
+
+    # -------------------------------------------------------------
     # Required fields
-    # ------------------------------------------------------------
+    # -------------------------------------------------------------
 
     required_values = {
         "invoice_number": invoice_number,
         "vendor_name": vendor_name,
-        "invoice_date": invoice_date,
+        "invoice_date": invoice_date_value,
         "currency": currency,
-        "subtotal_amount": subtotal,
-        "tax_amount": tax,
-        "total_amount": total,
+        "total_amount": total_value,
     }
 
-    missing_fields = [
-        name
-        for name, value in required_values.items()
-        if value is None
-        or (
-            isinstance(value, str)
-            and not value.strip()
-        )
-    ]
+    missing_fields: list[str] = []
+
+    for field, value in required_values.items():
+        if value is None or not _normalize_text(value):
+            missing_fields.append(field)
+
+    if not line_items:
+        missing_fields.append("line_items")
 
     required_fields_valid = not missing_fields
 
-    if missing_fields:
-        errors.append(
-            "Missing required fields: "
-            + ", ".join(missing_fields)
+    for field in missing_fields:
+        message = f"Required invoice field is missing: {field}."
+        errors.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="missing_required_field",
+            message=message,
+            severity="high",
+            details={"field": field},
         )
 
-    # ------------------------------------------------------------
-    # Date
-    # ------------------------------------------------------------
-
-    date_valid = _valid_date(
-        invoice_date
-    )
-
-    if invoice_date and not date_valid:
-        errors.append(
-            f"Invalid invoice date: {invoice_date}"
+    # A PO number can be mandatory for the business process, but it
+    # is kept separate from the basic data-completeness check so that
+    # the workflow can distinguish missing invoice data from an ERP
+    # or purchasing-process issue.
+    if not po_number:
+        message = "Purchase order number is missing."
+        warnings.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="missing_purchase_order",
+            message=message,
+            severity="high",
+            details={"field": "po_number"},
         )
 
-    # ------------------------------------------------------------
-    # Currency
-    # ------------------------------------------------------------
+    # -------------------------------------------------------------
+    # Date validation
+    # -------------------------------------------------------------
 
-    currency_valid = _valid_currency(
-        currency
+    parsed_invoice_date = _parse_date(invoice_date_value)
+    date_valid = parsed_invoice_date is not None
+
+    if invoice_date_value and not date_valid:
+        message = (
+            f"Invoice date '{invoice_date_value}' could not be parsed "
+            "unambiguously."
+        )
+        errors.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="invalid_invoice_date",
+            message=message,
+            details={"value": str(invoice_date_value)},
+        )
+
+    if parsed_invoice_date and parsed_invoice_date > date.today():
+        message = (
+            f"Invoice date {parsed_invoice_date.isoformat()} is in the future."
+        )
+        warnings.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="future_invoice_date",
+            message=message,
+            severity="medium",
+            details={"value": parsed_invoice_date.isoformat()},
+        )
+
+    # -------------------------------------------------------------
+    # Currency validation
+    # -------------------------------------------------------------
+
+    normalized_currency = _normalize_text(currency).upper()
+
+    # ISO 4217 codes are normally three uppercase letters. This checks
+    # format only; ERP currency matching happens in business validation.
+    currency_valid = bool(
+        re.fullmatch(r"[A-Z]{3}", normalized_currency)
     )
 
     if currency and not currency_valid:
-        errors.append(
-            f"Unsupported or invalid currency: {currency}"
+        message = (
+            f"Currency '{currency}' is not a valid three-letter "
+            "currency code format."
+        )
+        errors.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="invalid_currency_format",
+            message=message,
+            details={"value": str(currency)},
         )
 
-    # ------------------------------------------------------------
-    # Line totals
-    # ------------------------------------------------------------
+    # -------------------------------------------------------------
+    # Amount validation
+    # -------------------------------------------------------------
 
-    line_totals_valid, line_errors = (
-        _validate_line_totals(
-            line_items
+    subtotal = _to_decimal(subtotal_value)
+    tax_amount = _to_decimal(tax_value)
+    tax_rate = _to_decimal(tax_rate_value)
+    total_amount = _to_decimal(total_value)
+
+    amount_values = {
+        "subtotal_amount": (subtotal_value, subtotal),
+        "tax_amount": (tax_value, tax_amount),
+        "tax_rate": (tax_rate_value, tax_rate),
+        "total_amount": (total_value, total_amount),
+    }
+
+    for field, (raw_value, parsed_value) in amount_values.items():
+        if raw_value is not None and parsed_value is None:
+            message = f"{field} '{raw_value}' is not a valid numeric value."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_numeric_value",
+                message=message,
+                details={"field": field, "value": str(raw_value)},
+            )
+
+    for field, value in (
+        ("subtotal_amount", subtotal),
+        ("tax_amount", tax_amount),
+        ("total_amount", total_amount),
+    ):
+        if value is not None and value < 0:
+            message = (
+                f"{field} is negative ({value}). Verify whether this "
+                "document is a credit note or debit note."
+            )
+            warnings.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="negative_amount",
+                message=message,
+                severity="medium",
+                details={"field": field, "value": str(value)},
+            )
+
+    if tax_rate is not None and not (Decimal("0") <= tax_rate <= Decimal("100")):
+        message = f"Tax rate {tax_rate}% is outside the expected 0–100% range."
+        errors.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="invalid_tax_rate",
+            message=message,
+            details={"tax_rate": str(tax_rate)},
         )
-    )
 
-    errors.extend(line_errors)
+    tolerance = _amount_tolerance()
 
-    # ------------------------------------------------------------
-    # Subtotal
-    # ------------------------------------------------------------
+    # -------------------------------------------------------------
+    # Line-item validation
+    # -------------------------------------------------------------
 
-    subtotal_valid, subtotal_errors = (
-        _validate_subtotal(
-            line_items,
-            subtotal,
+    normalized_line_items: list[dict[str, Any]] = []
+    line_totals: list[Decimal] = []
+    all_line_totals_present = bool(line_items)
+
+    line_totals_valid = True
+
+    if not isinstance(line_items, list):
+        message = "Invoice line items must be a list."
+        errors.append(message)
+        _add_discrepancy(
+            discrepancies,
+            discrepancy_type="invalid_line_items",
+            message=message,
         )
-    )
+        line_items = []
+        all_line_totals_present = False
+        line_totals_valid = False
 
-    errors.extend(subtotal_errors)
+    for index, item in enumerate(line_items, start=1):
+        if not isinstance(item, dict):
+            message = f"Line item {index} is not a valid object."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_line_item",
+                message=message,
+                details={"line_number": index},
+            )
+            all_line_totals_present = False
+            line_totals_valid = False
+            continue
 
-    # ------------------------------------------------------------
-    # Tax
-    # ------------------------------------------------------------
+        normalized_item = dict(item)
+        normalized_line_items.append(normalized_item)
 
-    tax_valid, tax_errors = _validate_tax(
-        subtotal,
-        tax,
-        tax_rate,
-    )
+        sku = (
+            item.get("sku")
+            or item.get("sku_code")
+            or item.get("product_code")
+            or item.get("item_code")
+        )
+        description = item.get("description")
 
-    errors.extend(tax_errors)
+        if not sku and not description:
+            message = (
+                f"Line item {index} has neither an item code nor a description."
+            )
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="missing_line_item_identity",
+                message=message,
+                details={"line_number": index},
+            )
 
-    # ------------------------------------------------------------
-    # Total
-    # ------------------------------------------------------------
+        quantity_raw = item.get("quantity")
+        unit_price_raw = item.get("unit_price")
+        line_total_raw = (
+            item.get("line_total")
+            if item.get("line_total") is not None
+            else item.get("amount", item.get("total"))
+        )
 
-    total_valid, total_errors = _validate_total(
-        subtotal,
-        tax,
-        total,
-    )
+        quantity = _to_decimal(quantity_raw)
+        unit_price = _to_decimal(unit_price_raw)
+        line_total = _to_decimal(line_total_raw)
 
-    errors.extend(total_errors)
+        if quantity_raw is not None and quantity is None:
+            message = f"Line item {index} has an invalid quantity."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_line_quantity",
+                message=message,
+                details={"line_number": index, "value": str(quantity_raw)},
+            )
 
-    # ------------------------------------------------------------
+        if unit_price_raw is not None and unit_price is None:
+            message = f"Line item {index} has an invalid unit price."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_line_unit_price",
+                message=message,
+                details={"line_number": index, "value": str(unit_price_raw)},
+            )
+
+        if line_total_raw is not None and line_total is None:
+            message = f"Line item {index} has an invalid line total."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_line_total",
+                message=message,
+                details={"line_number": index, "value": str(line_total_raw)},
+            )
+
+        if quantity is None or unit_price is None or line_total is None:
+            all_line_totals_present = False
+
+        if quantity is not None and quantity <= 0:
+            message = f"Line item {index} quantity must be greater than zero."
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invalid_line_quantity",
+                message=message,
+                details={"line_number": index, "quantity": str(quantity)},
+            )
+
+        if unit_price is not None and unit_price < 0:
+            message = f"Line item {index} has a negative unit price."
+            warnings.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="negative_line_unit_price",
+                message=message,
+                severity="medium",
+                details={"line_number": index, "unit_price": str(unit_price)},
+            )
+
+        if line_total is not None:
+            line_totals.append(line_total)
+
+        if (
+            quantity is not None
+            and unit_price is not None
+            and line_total is not None
+        ):
+            calculated = quantity * unit_price
+
+            if abs(calculated - line_total) > tolerance:
+                line_totals_valid = False
+                message = (
+                    f"Line item {index}: quantity × unit price "
+                    f"({calculated}) does not match line total ({line_total})."
+                )
+                errors.append(message)
+                _add_discrepancy(
+                    discrepancies,
+                    discrepancy_type="line_total_mismatch",
+                    message=message,
+                    details={
+                        "line_number": index,
+                        "quantity": str(quantity),
+                        "unit_price": str(unit_price),
+                        "calculated_total": str(calculated),
+                        "line_total": str(line_total),
+                    },
+                )
+
+    # Missing arithmetic values do not themselves prove a mismatch.
+    # The completeness checks and human review flag handle those cases.
+    if line_items and not all_line_totals_present:
+        warnings.append(
+            "Some line items are missing quantity, unit price, or line total; "
+            "arithmetic validation is incomplete."
+        )
+
+    # -------------------------------------------------------------
+    # Subtotal validation
+    # -------------------------------------------------------------
+
+    subtotal_valid = True
+
+    if (
+        normalized_line_items
+        and all_line_totals_present
+        and len(line_totals) == len(normalized_line_items)
+        and subtotal is not None
+    ):
+        calculated_subtotal = sum(line_totals, Decimal("0"))
+
+        if abs(calculated_subtotal - subtotal) > tolerance:
+            subtotal_valid = False
+            message = (
+                f"Sum of line totals ({calculated_subtotal}) does not match "
+                f"subtotal ({subtotal})."
+            )
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="subtotal_mismatch",
+                message=message,
+                details={
+                    "calculated_subtotal": str(calculated_subtotal),
+                    "subtotal": str(subtotal),
+                },
+            )
+    elif subtotal is None:
+        subtotal_valid = False
+        warnings.append("Subtotal is unavailable; subtotal validation is incomplete.")
+
+    # -------------------------------------------------------------
+    # Tax validation
+    # -------------------------------------------------------------
+
+    tax_valid = True
+
+    if subtotal is not None and tax_amount is not None and tax_rate is not None:
+        expected_tax = subtotal * tax_rate / Decimal("100")
+
+        if abs(expected_tax - tax_amount) > tolerance:
+            tax_valid = False
+            message = (
+                f"Calculated tax ({expected_tax}) does not match extracted "
+                f"tax amount ({tax_amount}) using tax rate {tax_rate}%."
+            )
+            warnings.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="tax_calculation_mismatch",
+                message=message,
+                severity="medium",
+                details={
+                    "subtotal": str(subtotal),
+                    "tax_rate_percent": str(tax_rate),
+                    "calculated_tax": str(expected_tax),
+                    "tax_amount": str(tax_amount),
+                },
+            )
+    elif tax_amount is None:
+        tax_valid = False
+        warnings.append("Tax amount is unavailable; tax validation is incomplete.")
+
+    # -------------------------------------------------------------
+    # Total validation
+    # -------------------------------------------------------------
+
+    total_valid = True
+
+    if subtotal is not None and tax_amount is not None and total_amount is not None:
+        calculated_total = subtotal + tax_amount
+
+        if abs(calculated_total - total_amount) > tolerance:
+            total_valid = False
+            message = (
+                f"Subtotal plus tax ({calculated_total}) does not match "
+                f"invoice total ({total_amount})."
+            )
+            errors.append(message)
+            _add_discrepancy(
+                discrepancies,
+                discrepancy_type="invoice_total_mismatch",
+                message=message,
+                details={
+                    "subtotal": str(subtotal),
+                    "tax_amount": str(tax_amount),
+                    "calculated_total": str(calculated_total),
+                    "invoice_total": str(total_amount),
+                },
+            )
+    else:
+        total_valid = False
+        warnings.append(
+            "Subtotal, tax, or total is unavailable; total validation "
+            "is incomplete."
+        )
+
+    # -------------------------------------------------------------
     # Final result
-    # ------------------------------------------------------------
+    # -------------------------------------------------------------
 
     data_validation_passed = (
         required_fields_valid
@@ -418,11 +596,26 @@ def data_validate(
         and not errors
     )
 
-    if not data_validation_passed:
-        warnings.append(
-            "Invoice requires manual review because "
-            "one or more data validation checks failed."
+    existing_discrepancies = list(state.get("discrepancies") or [])
+
+    # Avoid duplicating the same discrepancy when validation is rerun.
+    # Keep previously resolved records intact; replace only currently
+    # generated open discrepancies of the same type and message.
+    generated_keys = {
+        (item.get("type"), item.get("message"))
+        for item in discrepancies
+    }
+
+    retained_discrepancies = [
+        item
+        for item in existing_discrepancies
+        if (
+            item.get("status") != "open"
+            or (item.get("type"), item.get("message")) not in generated_keys
         )
+    ]
+
+    merged_discrepancies = retained_discrepancies + discrepancies
 
     return {
         "required_fields_valid": required_fields_valid,
@@ -438,6 +631,15 @@ def data_validate(
         "validation_errors": errors,
         "validation_warnings": warnings,
         "missing_fields": missing_fields,
-        "human_review_required": not data_validation_passed,
+        "discrepancies": merged_discrepancies,
+        "human_review_required": bool(
+            state.get("human_review_required")
+            or not data_validation_passed
+        ),
         "processing_status": "data_validation_complete",
     }
+
+
+# Compatibility alias for graphs that import validate_invoice.
+def validate_invoice(state: dict[str, Any]) -> dict[str, Any]:
+    return data_validate(state)
