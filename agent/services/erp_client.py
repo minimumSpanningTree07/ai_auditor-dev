@@ -195,13 +195,25 @@ class ERPClient:
 
         data = self._request(
             "GET",
-            f"/sku/{quote(sku_code, safe='')}",
+            f"/sku/{quote(str(sku_code).strip(), safe='')}",
         )
 
         if not data:
             return None
 
-        return self._unwrap(data, "sku")
+        # Mock ERP returns the SKU object directly.
+        if isinstance(data, dict) and data.get("sku"):
+            return data
+
+        # Also support wrapped responses for compatibility.
+        if isinstance(data, dict):
+            for key in ("data", "item", "sku"):
+                value = data.get(key)
+
+                if isinstance(value, dict) and value.get("sku"):
+                    return value
+
+        raise ERPClientError("Invalid sku response from Mock ERP.")
 
     def get_skus(
         self,

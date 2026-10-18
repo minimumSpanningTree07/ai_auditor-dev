@@ -148,6 +148,86 @@ class ERPRepository:
     # PURCHASE ORDERS
     # ---------------------------------------------------------
 
+    # def get_purchase_order(
+    #     self,
+    #     po_number: str,
+    # ) -> dict[str, Any] | None:
+
+    #     if not po_number:
+    #         return None
+
+    #     purchase_order = self._fetch_one(
+    #         """
+    #         SELECT
+    #             po_number,
+    #             vendor_id,
+    #             vendor_name,
+    #             currency,
+    #             status
+    #         FROM erp.purchase_orders
+    #         WHERE po_number = %s
+    #         LIMIT 1
+    #         """,
+    #         (po_number,),
+    #     )
+
+    #     if purchase_order is None:
+    #         return None
+
+    #     lines = self._fetch_all(
+    #         """
+    #         SELECT
+    #             sku,
+    #             description,
+    #             quantity,
+    #             unit_price,
+    #             currency
+    #         FROM erp.purchase_order_lines
+    #         WHERE po_number = %s
+    #         ORDER BY id
+    #         """,
+    #         (po_number,),
+    #     )
+
+    #     purchase_order["lines"] = lines
+
+    #     return purchase_order
+
+    # def list_purchase_orders(self) -> list[dict[str, Any]]:
+
+    #     return self._fetch_all(
+    #         """
+    #         SELECT
+    #             po_number,
+    #             vendor_id,
+    #             vendor_name,
+    #             currency,
+    #             status
+    #         FROM erp.purchase_orders
+    #         ORDER BY po_number
+    #         """
+    #     )
+
+
+    def find_vendor_by_name(self, name: str) -> dict[str, Any] | None:
+        if not name:
+            return None
+
+        return self._fetch_one(
+            """
+            SELECT
+                vendor_id,
+                vendor_code,
+                vendor_name,
+                currency,
+                country,
+                active
+            FROM erp.vendors
+            WHERE LOWER(TRIM(vendor_name)) = LOWER(TRIM(%s))
+            LIMIT 1
+            """,
+            (name,),
+        )
     def get_purchase_order(
         self,
         po_number: str,
@@ -162,21 +242,23 @@ class ERPRepository:
                 po_number,
                 vendor_id,
                 vendor_name,
+                order_date,
                 currency,
                 status
             FROM erp.purchase_orders
             WHERE po_number = %s
             LIMIT 1
             """,
-            (po_number,),
+            (po_number.strip(),),
         )
 
         if purchase_order is None:
             return None
 
-        lines = self._fetch_all(
+        line_items = self._fetch_all(
             """
             SELECT
+                line_number,
                 sku,
                 description,
                 quantity,
@@ -184,39 +266,19 @@ class ERPRepository:
                 currency
             FROM erp.purchase_order_lines
             WHERE po_number = %s
-            ORDER BY id
+            ORDER BY line_number
             """,
-            (po_number,),
+            (po_number.strip(),),
         )
 
-        purchase_order["lines"] = lines
+        purchase_order["line_items"] = line_items
 
         return purchase_order
-
-    def list_purchase_orders(self) -> list[dict[str, Any]]:
-
-        return self._fetch_all(
-            """
-            SELECT
-                po_number,
-                vendor_id,
-                vendor_name,
-                currency,
-                status
-            FROM erp.purchase_orders
-            ORDER BY po_number
-            """
-        )
 
     # ---------------------------------------------------------
     # SKU
     # ---------------------------------------------------------
-
-    def get_sku(
-        self,
-        sku_code: str,
-    ) -> dict[str, Any] | None:
-
+    def get_sku(self, sku_code: str) -> dict[str, Any] | None:
         if not sku_code:
             return None
 
@@ -225,13 +287,34 @@ class ERPRepository:
             SELECT
                 sku,
                 description,
-                unit_of_measure
+                unit_of_measure,
+                active
             FROM erp.skus
-            WHERE sku = %s
+            WHERE LOWER(TRIM(sku)) = LOWER(TRIM(%s))
             LIMIT 1
             """,
             (sku_code,),
         )
+    # def get_sku(
+    #     self,
+    #     sku_code: str,
+    # ) -> dict[str, Any] | None:
+
+    #     if not sku_code:
+    #         return None
+
+    #     return self._fetch_one(
+    #         """
+    #         SELECT
+    #             sku,
+    #             description,
+    #             unit_of_measure
+    #         FROM erp.skus
+    #         WHERE sku = %s
+    #         LIMIT 1
+    #         """,
+    #         (sku_code,),
+    #     )
 
     def list_skus(self) -> list[dict[str, Any]]:
 

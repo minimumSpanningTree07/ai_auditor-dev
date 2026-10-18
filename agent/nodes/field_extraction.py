@@ -28,6 +28,32 @@ class InvoiceLine(BaseModel):
     line_total: Decimal | None = None
     currency: str | None = None
 
+    @field_validator("currency", mode="before")
+    @classmethod
+    def clean_line_currency(cls, value: Any) -> Any:
+        if value is None:
+            return None
+
+        cleaned = str(value).strip().upper()
+
+        currency_map = {
+            "$": "USD",
+            "US$": "USD",
+            "USD": "USD",
+            "€": "EUR",
+            "EUR": "EUR",
+            "£": "GBP",
+            "GBP": "GBP",
+            "₹": "INR",
+            "RS": "INR",
+            "RS.": "INR",
+            "INR": "INR",
+            "₫": "VND",
+            "VND": "VND",
+        }
+
+        return currency_map.get(cleaned, cleaned) or None
+
 
 class ExtractedInvoice(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -74,6 +100,14 @@ class ExtractedInvoice(BaseModel):
         cleaned = str(value).strip()
         return cleaned or None
 
+    # @field_validator("currency", mode="before")
+    # @classmethod
+    # def clean_currency(cls, value: Any) -> Any:
+    #     if value is None:
+    #         return None
+
+    #     cleaned = str(value).strip().upper()
+    #     return cleaned or None
     @field_validator("currency", mode="before")
     @classmethod
     def clean_currency(cls, value: Any) -> Any:
@@ -81,7 +115,24 @@ class ExtractedInvoice(BaseModel):
             return None
 
         cleaned = str(value).strip().upper()
-        return cleaned or None
+
+        currency_map = {
+            "$": "USD",
+            "US$": "USD",
+            "USD": "USD",
+            "€": "EUR",
+            "EUR": "EUR",
+            "£": "GBP",
+            "GBP": "GBP",
+            "₹": "INR",
+            "RS": "INR",
+            "RS.": "INR",
+            "INR": "INR",
+            "₫": "VND",
+            "VND": "VND",
+        }
+
+        return currency_map.get(cleaned, cleaned) or None
 
 
 FIELD_EXTRACTION_PROMPT = """
@@ -394,15 +445,19 @@ def _line_items_for_state(
 
     return result
 
-
 def _apply_corrections(
     extracted_values: dict[str, Any],
     corrections: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Apply human corrections to effective values only. The immutable
-    extracted_* values are never modified here.
+    Apply human corrections to effective values only.
+
+    Original extracted values are never modified.
+
+    Line-item corrections are merged into the matching original line,
+    preserving fields that were not corrected.
     """
+
     aliases = {
         "extracted_invoice_number": "invoice_number",
         "extracted_vendor_name": "vendor_name",
@@ -416,15 +471,218 @@ def _apply_corrections(
         "extracted_line_items": "line_items",
     }
 
+    # Shallow copy of the top-level dictionary.
+    # Line items are copied separately below.
     effective = dict(extracted_values)
+
+    corrections = corrections or {}
 
     for key, value in corrections.items():
         target = aliases.get(key, key)
 
-        if target in effective and value is not None:
+        if value is None:
+            continue
+
+        # ============================================================
+        # LINE ITEM CORRECTIONS
+        # ============================================================
+        if target == "line_items":
+
+            original_lines = effective.get("line_items") or []
+
+            # Copy every original line so the immutable extraction
+            # remains untouched.
+            merged_lines = [
+                dict(line) if isinstance(line, dict) else line
+                for line in original_lines
+            ]
+
+            if not isinstance(value, list):
+                continue
+
+            for correction in value:
+
+                if not isinstance(correction, dict):
+                    continue
+
+                correction_sku = (
+                    correction.get("item_code")
+                    or correction.get("sku")
+                    or correction.get("sku_code")
+                    or correction.get("product_code")
+                )
+
+                correction_line_number = correction.get("line_number")
+
+                matched_index = None
+
+                # ----------------------------------------------------
+                # Match by SKU first
+                # ----------------------------------------------------
+                if correction_sku:
+
+                    normalized_correction_sku = normalize_sku(
+                        correction_sku
+                    )
+
+                    for index, line in enumerate(merged_lines):
+
+                        if not isinstance(line, dict):
+                            continue
+
+                        line_sku = (
+                            line.get("item_code")
+                            or line.get("sku")
+                            or line.get("sku_code")
+                            or line.get("product_code")
+                        )
+
+                        if (
+                            line_sku
+                            and normalize_sku(line_sku)
+                            == normalized_correction_sku
+                        ):
+                            matched_index = index
+                            break
+
+                # ----------------------------------------------------
+                # Fall back to line number
+                # ----------------------------------------------------
+                if (
+                    matched_index is None
+                    and correction_line_number is not None
+                ):
+
+                    for index, line in enumerate(merged_lines):
+
+                        if not isinstance(line, dict):
+                            continue
+
+                        if (
+                            line.get("line_number")
+                            == correction_line_number
+                            or index + 1 == correction_line_number
+                        ):
+                            matched_index = index
+                            break
+
+                # ----------------------------------------------------
+                # If no matching line exists, add a new line
+                # ----------------------------------------------------
+                if matched_index is None:
+
+                    new_line = dict(correction)
+
+                    if correction_sku:
+
+                        normalized_sku = normalize_sku(
+                            correction_sku
+                        )
+
+                        new_line["item_code"] = normalized_sku
+                        new_line["sku"] = normalized_sku
+                        new_line["sku_code"] = normalized_sku
+                        new_line["product_code"] = normalized_sku
+
+                    merged_lines.append(new_line)
+                    continue
+
+                # ----------------------------------------------------
+                # Merge only corrected fields
+                # ----------------------------------------------------
+                existing_line = merged_lines[matched_index]
+
+                for field, corrected_value in correction.items():
+
+                    if corrected_value is not None:
+                        existing_line[field] = corrected_value
+
+                # ----------------------------------------------------
+                # Keep SKU aliases synchronized
+                # ----------------------------------------------------
+                corrected_sku = (
+                    existing_line.get("item_code")
+                    or existing_line.get("sku")
+                    or existing_line.get("sku_code")
+                    or existing_line.get("product_code")
+                )
+
+                if corrected_sku:
+
+                    normalized_sku = normalize_sku(corrected_sku)
+
+                    existing_line["item_code"] = normalized_sku
+                    existing_line["sku"] = normalized_sku
+                    existing_line["sku_code"] = normalized_sku
+                    existing_line["product_code"] = normalized_sku
+
+            # --------------------------------------------------------
+            # Recalculate line totals AFTER all corrections
+            # --------------------------------------------------------
+            for line in merged_lines:
+
+                if not isinstance(line, dict):
+                    continue
+
+                quantity = line.get("quantity")
+                unit_price = line.get("unit_price")
+
+                if quantity is None or unit_price is None:
+                    continue
+
+                try:
+                    line["line_total"] = str(
+                        Decimal(str(quantity))
+                        * Decimal(str(unit_price))
+                    )
+                except (
+                    InvalidOperation,
+                    ValueError,
+                    TypeError,
+                ):
+                    pass
+
+            effective["line_items"] = merged_lines
+            continue
+
+        # ============================================================
+        # SCALAR CORRECTIONS
+        # ============================================================
+        if target in effective:
             effective[target] = value
 
     return effective
+
+# def _apply_corrections(
+#     extracted_values: dict[str, Any],
+#     corrections: dict[str, Any],
+# ) -> dict[str, Any]:
+#     """
+#     Apply human corrections to effective values only. The immutable
+#     extracted_* values are never modified here.
+#     """
+#     aliases = {
+#         "extracted_invoice_number": "invoice_number",
+#         "extracted_vendor_name": "vendor_name",
+#         "extracted_po_number": "po_number",
+#         "extracted_invoice_date": "invoice_date",
+#         "extracted_currency": "currency",
+#         "extracted_subtotal_amount": "subtotal_amount",
+#         "extracted_tax_amount": "tax_amount",
+#         "extracted_tax_rate": "tax_rate",
+#         "extracted_total_amount": "total_amount",
+#         "extracted_line_items": "line_items",
+#     }
+
+#     effective = dict(extracted_values)
+
+#     for key, value in corrections.items():
+#         target = aliases.get(key, key)
+
+#         if target in effective and value is not None:
+#             effective[target] = value
+
+#     return effective
 
 
 def extract_fields(state: dict[str, Any]) -> dict[str, Any]:
@@ -513,7 +771,8 @@ def extract_fields(state: dict[str, Any]) -> dict[str, Any]:
             "extracted_tax_amount": extracted_values["tax_amount"],
             "extracted_tax_rate": extracted_values["tax_rate"],
             "extracted_total_amount": extracted_values["total_amount"],
-            "extracted_line_items": line_items,
+            #"extracted_line_items": line_items,
+            "extracted_line_items": extracted_values["line_items"],
 
             # Existing effective_* fields consumed by validation/persistence.
             "effective_invoice_number": effective["invoice_number"],

@@ -28,6 +28,7 @@ class InvoiceWatcher:
         self.completed: dict[str, tuple[int, int]] = {}
         self.retry_after: dict[str, float] = {}
         self.retry_delay = 30
+        self.known_files: set[str] = set()
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, int]:

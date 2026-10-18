@@ -13,7 +13,11 @@ services:
       - ./database/02_erp_seed.sql:/docker-entrypoint-initdb.d/02_erp_seed.sql:ro
       - ./database/03_audit_schema.sql:/docker-entrypoint-initdb.d/03_audit_schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-invoice_user} -d ${POSTGRES_DB:-invoice_auditor}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-invoice_user} -d ${POSTGRES_DB:-invoice_auditor}"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -35,29 +39,34 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c '</dev/tcp/localhost/6333'"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+    restart: unless-stopped
 
   mock-erp:
-    env_file:
-      - .env
     build:
       context: .
       dockerfile: docker/mock-erp.Dockerfile
-    ports:
-      - "8001:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
+    env_file:
+      - .env
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -75,6 +84,54 @@ services:
     build:
       context: .
       dockerfile: docker/agent.Dockerfile
+    env_file:
+      - .env
+    environment:
+      # PostgreSQL
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DATABASE_URL: postgresql://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
+
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+
+      # Qdrant
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-invoice_documents}
+
+      # Mock ERP
+      MOCK_ERP_URL: http://mock-erp:8000
+
+      # AWS Bedrock
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      
+
+      # LLM models
+      LLM_MODEL: ${LLM_MODEL:-bedrock/amazon.nova-lite-v1:0}
+      RAG_MODEL: ${RAG_MODEL:-bedrock/cohere.command-r-plus-v1:0}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-bedrock/cohere.command-r-plus-v1:0}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bedrock/amazon.titan-embed-text-v1}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1536}
+
+      # LLM settings
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.0}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1000}
+
+      # OCR
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng+vie}
+
+      # AWS shared credentials/config paths
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
     ports:
       - "8000:8000"
     depends_on:
@@ -86,34 +143,10 @@ services:
         condition: service_healthy
       mock-erp:
         condition: service_healthy
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
-      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      DATABASE_URL: postgresql://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_DB: 0
-      QDRANT_HOST: qdrant
-      QDRANT_PORT: 6333
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-invoice_documents}
-      MOCK_ERP_URL: http://mock-erp:8000
-      AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
-      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
-      LLM_MODEL: ${LLM_MODEL:-bedrock/amazon.nova-lite-v1:0}
-      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng+spa+deu}
-      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
-      AWS_CONFIG_FILE: /root/.aws/config
-    env_file:
-      - .env
     volumes:
       - ./data/incoming:/app/data/incoming
       - ./outputs/reports:/app/outputs/reports
-      - ./home/labuser/.aws:/root/.aws:ro
+      - /home/labuser/.aws:/root/.aws:ro
     healthcheck:
       test:
         [
@@ -125,21 +158,22 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
     restart: unless-stopped
 
   ui:
-    env_file:
-      - .env
     build:
       context: .
       dockerfile: docker/ui.Dockerfile
+    env_file:
+      - .env
+    environment:
+      AGENT_URL: http://agent:8000
     ports:
       - "8501:8501"
     depends_on:
       agent:
         condition: service_healthy
-    environment:
-      AGENT_URL: http://agent:8000
     restart: unless-stopped
 
 volumes:

@@ -51,14 +51,6 @@ REPORTS_DIR = Path(
 
 @dataclass(frozen=True)
 class Settings:
-    """
-    Central configuration for the Invoice Auditor agent.
-
-    Values are read from environment variables so that the same
-    application can run locally and inside Docker.
-
-    Docker service names must be used for internal communication.
-    """
 
     # --------------------------------------------------------
     # Application
@@ -110,10 +102,12 @@ class Settings:
     qdrant_collection: str
 
     # --------------------------------------------------------
-    # LLM / LiteLLM
+    # LiteLLM / AWS Bedrock
     # --------------------------------------------------------
 
     llm_model: str
+    rag_model: str
+    translation_model: str
     llm_temperature: float
     llm_max_tokens: int
 
@@ -160,13 +154,10 @@ class Settings:
 # ENVIRONMENT HELPERS
 # ============================================================
 
-def _get_env(name: str, default: str | None = None) -> str:
-    """
-    Read an environment variable.
-
-    Raises an error when a required value is missing.
-    """
-
+def _get_env(
+    name: str,
+    default: str | None = None,
+) -> str:
     value = os.getenv(name)
 
     if value is None or not value.strip():
@@ -180,7 +171,10 @@ def _get_env(name: str, default: str | None = None) -> str:
     return value.strip()
 
 
-def _get_int(name: str, default: int | None = None) -> int:
+def _get_int(
+    name: str,
+    default: int | None = None,
+) -> int:
     value = _get_env(
         name,
         str(default) if default is not None else None,
@@ -195,7 +189,10 @@ def _get_int(name: str, default: int | None = None) -> int:
         ) from exc
 
 
-def _get_float(name: str, default: float | None = None) -> float:
+def _get_float(
+    name: str,
+    default: float | None = None,
+) -> float:
     value = _get_env(
         name,
         str(default) if default is not None else None,
@@ -210,8 +207,14 @@ def _get_float(name: str, default: float | None = None) -> float:
         ) from exc
 
 
-def _get_bool(name: str, default: bool = False) -> bool:
-    value = _get_env(name, str(default)).lower()
+def _get_bool(
+    name: str,
+    default: bool = False,
+) -> bool:
+    value = _get_env(
+        name,
+        str(default),
+    ).lower()
 
     if value in {"1", "true", "yes", "y", "on"}:
         return True
@@ -230,9 +233,6 @@ def _get_bool(name: str, default: bool = False) -> bool:
 # ============================================================
 
 def load_settings() -> Settings:
-    """
-    Build application settings from environment variables.
-    """
 
     settings = Settings(
 
@@ -356,12 +356,25 @@ def load_settings() -> Settings:
         ),
 
         # ----------------------------------------------------
-        # LLM / LiteLLM
+        # LiteLLM / AWS Bedrock
         # ----------------------------------------------------
 
+        # Reasoning / summarization
         llm_model=_get_env(
             "LLM_MODEL",
-            "gpt-4o-mini",
+            "bedrock/amazon.nova-lite-v1:0",
+        ),
+
+        # RAG answer generation
+        rag_model=_get_env(
+            "RAG_MODEL",
+            "bedrock/cohere.command-r-plus-v1",
+        ),
+
+        # Translation
+        translation_model=_get_env(
+            "TRANSLATION_MODEL",
+            "bedrock/cohere.command-r-plus-v1",
         ),
 
         llm_temperature=_get_float(
@@ -378,14 +391,19 @@ def load_settings() -> Settings:
         # Embeddings
         # ----------------------------------------------------
 
+        # Bedrock Cohere embedding model.
+        # IMPORTANT:
+        # This is NOT an OpenAI embedding model.
         embedding_model=_get_env(
             "EMBEDDING_MODEL",
-            "text-embedding-3-small",
+            "bedrock/amazon.titan-embed-text-v1",
         ),
 
+        # Cohere Embed English v3 produces 1024-dimensional
+        # embeddings.
         embedding_dimension=_get_int(
             "EMBEDDING_DIMENSION",
-            1536,
+            1024,
         ),
 
         # ----------------------------------------------------
@@ -437,7 +455,7 @@ def load_settings() -> Settings:
 
         ocr_languages=_get_env(
             "OCR_LANGUAGES",
-            "eng",
+            "eng+vie",
         ),
     )
 
@@ -456,9 +474,6 @@ settings = load_settings()
 # ============================================================
 
 def ensure_directories() -> None:
-    """
-    Create runtime directories if they don't already exist.
-    """
 
     settings.incoming_dir.mkdir(
         parents=True,

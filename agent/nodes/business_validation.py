@@ -82,16 +82,26 @@ def _get_sku(item: dict[str, Any]) -> str:
 def _get_invoice_line_items(
     state: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    items = (
-        _effective(state, "line_items")
-        or state.get("extracted_line_items")
-        or []
-    )
+    """
+    Business validation must always use effective/human-corrected
+    invoice values. Original extracted values are fallback only.
+    """
+    items = state.get("effective_line_items")
+
+    if items is None:
+        items = state.get("line_items")
+
+    if items is None:
+        items = state.get("extracted_line_items")
 
     if not isinstance(items, list):
         return []
 
-    return [item for item in items if isinstance(item, dict)]
+    return [
+        item
+        for item in items
+        if isinstance(item, dict)
+    ]
 
 
 def _add_discrepancy(
@@ -660,26 +670,35 @@ def business_validate(state: dict[str, Any]) -> dict[str, Any]:
             "the missing records before final validation."
         )
 
+    # -------------------------------------------------------------
+    # Final discrepancy handling
+    # -------------------------------------------------------------
+    #
+    # Revalidation always produces a fresh active discrepancy set.
+    # Historical discrepancies remain preserved in the audit database
+    # and must not be reused as active validation results.
+
     existing_discrepancies = list(state.get("discrepancies") or [])
 
-    # Retain resolved historical discrepancies. Replace open discrepancies
-    # generated with the same type/message to avoid duplicates on reruns.
-    generated_keys = {
-        (item.get("type"), item.get("message"))
-        for item in discrepancies
-    }
+    if state.get("workflow_mode") == "human_revalidation":
+        # Human corrections must be validated from scratch.
+        merged_discrepancies = list(discrepancies)
+    else:
+        generated_keys = {
+            (item.get("type"), item.get("message"))
+            for item in discrepancies
+        }
 
-    retained_discrepancies = [
-        item
-        for item in existing_discrepancies
-        if (
-            item.get("status") != "open"
-            or (item.get("type"), item.get("message")) not in generated_keys
-        )
-    ]
+        retained_discrepancies = [
+            item
+            for item in existing_discrepancies
+            if (
+                item.get("status") != "open"
+                or (item.get("type"), item.get("message")) not in generated_keys
+            )
+        ]
 
-    merged_discrepancies = retained_discrepancies + discrepancies
-
+        merged_discrepancies = retained_discrepancies + discrepancies
     return {
         "erp_vendor": vendor,
         "erp_purchase_order": purchase_order,

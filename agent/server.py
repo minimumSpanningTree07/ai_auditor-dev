@@ -285,15 +285,16 @@ def revalidate_invoice(
             detail="Original invoice file no longer exists",
         )
 
-    state: dict[str, Any] = {
-        "invoice_id": invoice_id,
-        "file_path": str(file_path),
-        "file_name": invoice["file_name"],
-        "workflow_mode": "human_revalidation",
-        "force_revalidation": True,
-        "human_decision": request.decision,
-        "human_feedback": request.feedback,
-        "human_corrections": request.corrections,
+    state = {
+    "invoice_id": invoice_id,
+    "file_path": str(file_path),
+    "file_name": invoice["file_name"],
+    "workflow_mode": "human_revalidation",
+    "thread_id": f"{invoice_id}:revalidation:{uuid.uuid4()}",
+    "force_revalidation": True,
+    "human_decision": request.decision,
+    "human_feedback": request.feedback,
+    "human_corrections": request.corrections,
     }
 
     result = process_invoice(state)

@@ -3,130 +3,141 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from agent.rag.augmentation import augment_context
-from agent.rag.generation import generate_answer
-from agent.rag.reflection import reflect_answer
-from agent.rag.retrieval import retrieve_documents
+from agent.config import settings
 
 
-STRUCTURED_TERMS = {
-    "invoice",
-    "invoice number",
-    "vendor",
-    "supplier",
-    "purchase order",
-    "po",
-    "sku",
-    "quantity",
-    "price",
-    "amount",
-    "tax",
-    "subtotal",
-    "total",
-    "currency",
-    "discrepancy",
-    "validation",
-    "status",
-    "recommendation",
-}
+# Only these read-only query categories are routed to SQL.
+# Everything else goes through RAG.
+_STRUCTURED_PATTERNS = [
+    r"\b(invoice\s+number|invoice\s+no)\b",
+    r"\b(vendor|supplier)\b.*\b(invoice|invoices)\b",
+    r"\b(invoice|invoices)\b.*\b(status|state)\b",
+    r"\b(invoice|invoices)\b.*\b(total|amount|value)\b",
+    r"\b(invoice|invoices)\b.*\b(discrepanc|mismatch|difference)\b",
+    r"\b(invoice|invoices)\b.*\b(recommendation|decision)\b",
+    r"\b(invoice|invoices)\b.*\b(po|purchase\s+order)\b",
+    r"\b(invoice|invoices)\b.*\b(currency)\b",
+]
 
 
-def classify_query(question: str) -> str:
-    normalized = question.lower().strip()
-
-    if not normalized:
-        return "unknown"
-
-    if any(
-        term in normalized
-        for term in STRUCTURED_TERMS
-    ):
-        return "structured"
-
-    return "semantic"
-
-
-def _extract_invoice_id(question: str) -> str | None:
-    match = re.search(
-        r"\bINV[-_ ]?\d+\b",
-        question,
-        re.IGNORECASE,
+def _normalize(question: str) -> str:
+    return " ".join(
+        question.strip().lower().split()
     )
 
-    return match.group(0) if match else None
+
+def classify_question(
+    question: str,
+) -> str:
+    """
+    Classify a question as:
+
+        structured -> direct PostgreSQL query
+        rag        -> Qdrant + generation
+
+    This router only decides the query path.
+    It does not execute SQL.
+    """
+
+    normalized = _normalize(question)
+
+    if not normalized:
+        return "rag"
+
+    for pattern in _STRUCTURED_PATTERNS:
+        if re.search(pattern, normalized):
+            return "structured"
+
+    return "rag"
+
+
+def extract_invoice_id(
+    question: str,
+) -> str | None:
+    """
+    Extract an explicit invoice identifier when present.
+
+    Examples:
+        INV-1001
+        INV-1001-CLEAN-V2
+    """
+
+    match = re.search(
+        r"\bINV[-_][A-Za-z0-9_-]+\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    return match.group(0)
+
+
+def extract_rag_filters(
+    question: str,
+) -> dict[str, Any]:
+    """
+    Extract safe filters that can be applied to Qdrant retrieval.
+    """
+
+    invoice_id = extract_invoice_id(question)
+
+    filters: dict[str, Any] = {}
+
+    if invoice_id:
+        filters["invoice_id"] = invoice_id
+
+    return filters
 
 
 def route_question(
     question: str,
 ) -> dict[str, Any]:
-    intent = classify_query(question)
+    """
+    Route a user question to either the structured SQL path
+    or the open-ended RAG path.
+    """
 
-    if intent == "unknown":
+    question = question.strip()
+
+    intent = classify_question(question)
+
+    if intent == "structured":
         return {
-            "query_intent": "unknown",
-            "retrieved_documents": [],
-            "augmented_context": "",
-            "rag_answer": (
-                "Please provide a question about an invoice, "
-                "vendor, purchase order, validation result, "
-                "discrepancy, or related audit information."
+            "rag_intent": "structured",
+            "rag_question": question,
+            "rag_filters": extract_rag_filters(
+                question
             ),
-            "rag_context_relevance": 0.0,
-            "rag_answer_groundedness": 0.0,
-            "rag_question_relevance": 0.0,
-            "rag_triad_score": 0.0,
+            "rag_route": "sql",
         }
 
-    documents = retrieve_documents(
-        question=question,
-    )
-
-    invoice_id = _extract_invoice_id(question)
-
-    if invoice_id:
-        matching = [
-            document
-            for document in documents
-            if str(
-                document.get("invoice_number") or ""
-            ).lower()
-            == invoice_id.lower()
-        ]
-
-        if matching:
-            documents = matching
-
-    context = augment_context(
-        question,
-        documents,
-    )
-
-    generated = generate_answer(
-        question,
-        context,
-    )
-
-    reflection = reflect_answer(
-        question,
-        context,
-        generated.get("rag_answer", ""),
-    )
-
     return {
-        "query_intent": intent,
-        "query_filters": {
-            "invoice_number": invoice_id,
-        },
-        "retrieved_documents": documents,
-        "augmented_context": context,
-        **generated,
-        **reflection,
+        "rag_intent": "open_ended",
+        "rag_question": question,
+        "rag_filters": extract_rag_filters(
+            question
+        ),
+        "rag_route": "rag",
+        "rag_retry_count": 0,
+        "rag_max_retries": settings.rag_max_retries,
     }
 
 
-def answer_question(
+def route_state(
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    return route_question(
-        str(state.get("question") or "")
-    )
+    """
+    Route the question contained in workflow state.
+    """
+
+    question = str(
+        state.get("rag_question")
+        or state.get("question")
+        or ""
+    ).strip()
+
+    result = route_question(question)
+
+    return result

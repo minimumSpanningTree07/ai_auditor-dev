@@ -28,7 +28,17 @@ def health() -> dict[str, bool]:
     return {
         "status": healthy,
     }
+@app.get("/vendor/search")
+def search_vendor(name: str):
+    vendor = repository.find_vendor_by_name(name)
 
+    if vendor is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Vendor not found: {name}",
+        )
+
+    return vendor
 
 # Required API: retrieve a vendor by its ERP vendor ID.
 @app.get("/vendor/{vendor_id}", response_model=Vendor)
