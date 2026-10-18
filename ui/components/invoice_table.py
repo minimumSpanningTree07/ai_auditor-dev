@@ -87,20 +87,13 @@ def render_invoice_table(
             "invoice_id"
         )
 
-        invoice_number = (
-            invoice.get(
-                "invoice_number"
-            )
-            or invoice.get(
-                "file_name"
-            )
-            or invoice_id
-        )
+        invoice_number = invoice.get("invoice_number") or "Invoice number pending"
+        file_name = invoice.get("file_name") or "Unnamed file"
+        vendor = invoice.get("vendor_name") or "Vendor unknown"
 
         if invoice_id:
-            options[
-                str(invoice_number)
-            ] = invoice_id
+            label = f"{file_name} | {invoice_number} | {vendor} | {invoice_id[:8]}"
+            options[label] = invoice_id
 
     if not options:
         return None

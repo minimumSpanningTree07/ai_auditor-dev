@@ -16,7 +16,7 @@ pytesseract
 python-docx
 pdf2image
 Pillow
-qdrant-client
+qdrant-client>=1.13,<1.15
 fastapi
 uvicorn[standard]
 litellm

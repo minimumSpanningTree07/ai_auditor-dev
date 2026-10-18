@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -66,7 +67,7 @@ class InvoiceWatcher:
                 "thread_id": invoice_id,
                 "invoice_id": invoice_id,
                 "file_path": str(path.resolve()),
-                "file_name": path.name,
+                "file_name": re.sub(r"^[0-9a-f]{32}__", "", path.name, flags=re.IGNORECASE),
                 "file_checksum": metadata.get("file_checksum"),
                 "file_size": metadata.get("file_size"),
             }
@@ -94,38 +95,27 @@ class InvoiceWatcher:
             self.processing.discard(key)
 
     async def scan_once(self) -> None:
-        files = self.discover_files()
-        current_files = {str(path.resolve()): path for path in files}
+        """Scan all present files; process_file skips completed signatures and observes retry cooldowns."""
+        try:
+            files = self.discover_files()
+            current_files = {str(path.resolve()): path for path in files}
+            present = set(current_files)
 
-        new_files = set(current_files) - self.known_files
-        self.known_files = set(current_files)
+            # Forget state for files that were removed, so a later re-upload is eligible.
+            for key in list(self.completed):
+                if key not in present:
+                    self.completed.pop(key, None)
+            for key in list(self.retry_after):
+                if key not in present:
+                    self.retry_after.pop(key, None)
 
-        if new_files:
-            logger.info(
-                "Watcher found %d new invoice file(s) in %s",
-                len(new_files),
-                self.directory,
-            )
+            if files:
+                logger.debug("Watcher scan found %d supported file(s)", len(files))
 
-        for file_key in sorted(new_files):
-            path = current_files[file_key]
-            await self.process_file(path)
-            
-    # async def scan_once(self) -> None:
-    #     try:
-    #         files = self.discover_files()
-    #         if files:
-    #             logger.info("Watcher found %d supported invoice file(s) in %s", len(files), self.directory)
-    #         present = {str(p.resolve()) for p in files}
-    #         # Forget removed/renamed files so a later re-upload is handled cleanly.
-    #         for key in list(self.completed):
-    #             if key not in present:
-    #                 self.completed.pop(key, None)
-    #                 self.retry_after.pop(key, None)
-    #         for path in files:
-    #             await self.process_file(path)
-    #     except Exception:
-    #         logger.exception("Watcher scan failed")
+            for key in sorted(current_files):
+                await self.process_file(current_files[key])
+        except Exception:
+            logger.exception("Watcher scan failed")
 
     async def run(self) -> None:
         logger.info("Invoice watcher started directory=%s interval=%ss", self.directory, self.interval)

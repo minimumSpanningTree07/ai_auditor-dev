@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 

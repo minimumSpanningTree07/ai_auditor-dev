@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/01_erp_schema.sql:/docker-entrypoint-initdb.d/01_erp_schema.sql:ro
@@ -35,7 +35,7 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.13.2
     ports:
-      - "6333:6333"
+      - "6339:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -63,7 +63,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "8001:8000"
+      - "8009:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,7 +93,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-invoice_auditor}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      DATABASE_URL: postgresql://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-invoice_auditor}
 
       # Redis
       REDIS_HOST: redis
@@ -117,8 +116,8 @@ services:
 
       # LLM models
       LLM_MODEL: ${LLM_MODEL:-bedrock/amazon.nova-lite-v1:0}
-      RAG_MODEL: ${RAG_MODEL:-bedrock/cohere.command-r-plus-v1:0}
-      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-bedrock/cohere.command-r-plus-v1:0}
+      RAG_MODEL: ${RAG_MODEL:-bedrock/amazon.nova-lite-v1:0}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-bedrock/amazon.nova-lite-v1:0}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bedrock/amazon.titan-embed-text-v1}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1536}
 
@@ -133,7 +132,7 @@ services:
       AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
       AWS_CONFIG_FILE: /root/.aws/config
     ports:
-      - "8000:8000"
+      - "8010:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,8 +168,9 @@ services:
       - .env
     environment:
       AGENT_URL: http://agent:8000
+      ERP_URL: http://mock-erp:8000
     ports:
-      - "8501:8501"
+      - "8503:8501"
     depends_on:
       agent:
         condition: service_healthy

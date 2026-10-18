@@ -3,7 +3,6 @@
 # import hashlib
 # import json
 # from typing import Any
-
 # import redis
 # from litellm import completion
 
@@ -253,11 +252,14 @@ from __future__ import annotations
 
 import hashlib
 from typing import Any
+import logging
 
 import redis
 from litellm import completion
 
 from agent.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _redis_client() -> redis.Redis:
@@ -327,13 +329,14 @@ Answer the user's question using ONLY the information contained
 in the retrieved invoice context below.
 
 Rules:
-1. Do not invent information.
-2. Do not use outside knowledge.
-3. If the answer is not present in the context, say:
-   "The retrieved invoice context does not contain enough information
-   to answer this question."
-4. Use exact invoice values when available.
-5. Keep the answer concise and factual.
+1. Answer the exact question in the first sentence; do not begin with a generic invoice summary.
+2. Use ONLY facts supported by the context. Never invent invoice values or assume missing data.
+3. If evidence is insufficient, clearly say what is missing instead of guessing.
+4. Use exact invoice numbers, currency, amounts, dates, SKU values and discrepancy names.
+5. For discrepancy questions, explain each relevant finding in plain language: what failed, the recorded evidence, why it matters, and the next useful check when the context supports it.
+6. Distinguish extracted invoice content from the saved audit/validation conclusion. The saved audit record is authoritative for current status; retrieved passages are supporting source text.
+7. Keep the answer focused and readable. Use short paragraphs or bullets when there are multiple findings. Do not dump every field unless the user asks for a full summary.
+8. If the question asks why an invoice needs manual review, connect the specific recorded findings to the review status. Do not claim a cause that is not in the context.
 
 USER QUESTION:
 {question}
@@ -372,24 +375,42 @@ def generate(
         context=context,
     )
 
-    response = completion(
-        model=settings.rag_model,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        temperature=float(settings.llm_temperature),
-        max_tokens=int(settings.llm_max_tokens),
-    )
+    models_to_try = [settings.rag_model]
+    # Some Bedrock model families return an empty/incompatible chat payload
+    # through LiteLLM in certain regions/accounts. Retry once with the already
+    # configured primary model before letting the caller use deterministic audit facts.
+    if settings.llm_model and settings.llm_model not in models_to_try:
+        models_to_try.append(settings.llm_model)
 
-    answer = response.choices[0].message.content
+    last_error: Exception | None = None
+    answer = ""
+    for model_name in models_to_try:
+        try:
+            response = completion(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=float(settings.llm_temperature),
+                max_tokens=int(settings.llm_max_tokens),
+            )
+            content = response.choices[0].message.content
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text", "") if isinstance(item, dict) else item)
+                    for item in content
+                )
+            answer = str(content or "").strip()
+            if answer:
+                break
+            last_error = RuntimeError(f"Model {model_name} returned an empty response")
+        except Exception as exc:
+            last_error = exc
+            logger.warning("RAG generation model failed model=%s error_type=%s", model_name, type(exc).__name__)
 
     if not answer:
-        raise RuntimeError("LLM returned an empty response.")
-
-    answer = str(answer).strip()
+        raise RuntimeError(
+            f"All configured answer models failed ({', '.join(models_to_try)}): "
+            f"{type(last_error).__name__ if last_error else 'empty response'}"
+        ) from last_error
 
     _set_cached(
         question=question,

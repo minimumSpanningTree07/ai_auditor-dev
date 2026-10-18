@@ -1,73 +1,25 @@
-# from __future__ import annotations
-
-# from typing import Any
-
-# import streamlit as st
-
-
-# def render_dashboard(summary: dict[str, Any]) -> None:
-#     st.subheader("Dashboard")
-
-#     total = summary.get("total", 0)
-#     approved = summary.get("approved", 0)
-#     manual_review = summary.get("manual_review", 0)
-#     rejected = summary.get("rejected", 0)
-
-#     columns = st.columns(4)
-
-#     with columns[0]:
-#         st.metric("Total Invoices", total)
-
-#     with columns[1]:
-#         st.metric("Approved", approved)
-
-#     with columns[2]:
-#         st.metric("Manual Review", manual_review)
-
-#     with columns[3]:
-#         st.metric("Rejected", rejected)
-
 from __future__ import annotations
 
 import streamlit as st
 
 
 def render_dashboard(summary: dict) -> None:
-
     st.title("Dashboard")
     st.caption("AI Invoice Auditor")
 
-    total = summary.get("total_invoices", 0)
-    pending = summary.get("pending", 0)
-    approved = summary.get("approved", 0)
-    review = summary.get("manual_review", 0)
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Total Invoices",
-            total,
-        )
-
-    with col2:
-        st.metric(
-            "Pending",
-            pending,
-        )
-
-    with col3:
-        st.metric(
-            "Approved",
-            approved,
-        )
-
-    with col4:
-        st.metric(
-            "Manual Review",
-            review,
-        )
+    columns = st.columns(4)
+    metrics = [
+        ("Total invoices", summary.get("total_invoices", 0)),
+        ("Approved", summary.get("approved_invoices", 0)),
+        ("Needs review", summary.get("review_invoices", 0)),
+        ("Pending review", summary.get("pending_review", 0)),
+    ]
+    for column, (label, value) in zip(columns, metrics):
+        column.metric(label, value or 0)
 
     st.divider()
-
-    st.subheader("Recent Invoices")
+    st.subheader("Discrepancies")
+    cols = st.columns(3)
+    cols[0].metric("Total", summary.get("total_discrepancies", 0) or 0)
+    cols[1].metric("Open", summary.get("open_discrepancies", 0) or 0)
+    cols[2].metric("High severity", summary.get("high_severity_discrepancies", 0) or 0)

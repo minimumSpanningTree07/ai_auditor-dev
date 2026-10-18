@@ -124,16 +124,23 @@ def _determine_outcome(
     open_discrepancies: list[dict[str, Any]],
 ) -> tuple[str, str, bool]:
     """
-    Determine the audit outcome conservatively.
+    Determine the final audit outcome from the current validation run.
 
-    A human approval must not override failed validation flags. The
-    invoice must pass both data validation and business validation
-    before it can be recommended for approval.
+    An explicit auditor approval is a recorded human override: it updates
+    the workflow status to approved while leaving findings visible in the
+    report. Without that explicit override, a corrected invoice is approved
+    only when the current validation results pass. Do not use the sticky
+    human_review_required flag from an earlier extraction as a permanent veto.
     """
     decision = str(state.get("human_decision") or "").strip().lower()
 
     if decision in {"reject", "rejected"}:
         return "rejected", "reject", False
+
+    # Explicit human decision takes precedence over the automated
+    # recommendation. The report still retains any unresolved findings.
+    if decision in {"approve", "approved"}:
+        return "approved", "approve", False
 
     data_passed = state.get("data_validation_passed") is True
     business_passed = state.get("business_validation_passed") is True
@@ -142,8 +149,6 @@ def _determine_outcome(
     missing_erp_records = state.get("missing_erp_records") or []
     missing_fields = state.get("missing_fields") or []
 
-    existing_review_required = bool(state.get("human_review_required"))
-
     if (
         not data_passed
         or not business_passed
@@ -151,12 +156,8 @@ def _determine_outcome(
         or missing_erp_records
         or missing_fields
         or open_discrepancies
-        or existing_review_required
     ):
         return "manual_review", "manual_review", True
-
-    if decision in {"approve", "approved"}:
-        return "approved", "approve", False
 
     return "approved", "approve", False
 
@@ -257,6 +258,13 @@ def generate_report(state: dict[str, Any]) -> dict[str, Any]:
         state.get("business_validation_warnings"),
         state.get("warnings"),
     )
+
+    human_decision = str(state.get("human_decision") or "").strip().lower()
+    if human_decision in {"approve", "approved"} and unresolved:
+        validation_warnings.append(
+            "An auditor explicitly approved this invoice while one or more findings remain unresolved. "
+            "Review the findings and recorded human feedback before payment."
+        )
 
     validation_status, recommendation, human_review_required = (
         _determine_outcome(state, unresolved)

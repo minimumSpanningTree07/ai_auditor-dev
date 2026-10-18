@@ -298,18 +298,23 @@ def augment(
             ↓
         context construction
     """
+    # Similarity scores are not calibrated like the LLM reflection score.
+    # Do not reuse RAG_SCORE_THRESHOLD (used for answer evaluation) as a
+    # retrieval cutoff; values such as 0.19 can still contain useful evidence.
     if threshold is None:
-        threshold = float(settings.rag_score_threshold)
+        threshold = 0.0
 
     filtered = _filter_by_score(documents, threshold)
     deduplicated = _deduplicate(filtered)
     ranked = _rank_documents(deduplicated)
     context = _build_context(ranked)
 
+    has_context = bool(ranked and context.strip())
     return {
         "documents": ranked,
         "context": context,
-        "sufficient": bool(ranked and context.strip()),
+        "sufficient": has_context,
+        "has_sufficient_context": has_context,
         "threshold": threshold,
     }
 
@@ -322,7 +327,7 @@ def augment_state(state: dict[str, Any]) -> dict[str, Any]:
 
     result = augment(
         documents=documents,
-        threshold=float(settings.rag_score_threshold),
+        threshold=0.0,
     )
 
     return {

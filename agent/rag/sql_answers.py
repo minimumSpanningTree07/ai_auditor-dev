@@ -125,11 +125,11 @@ def invoice_discrepancies(
     return _fetch_all(
         """
         SELECT
-            field_name,
-            invoice_value,
-            erp_value,
-            deviation,
-            message
+            discrepancy_type,
+            severity,
+            message,
+            details,
+            status
         FROM audit.discrepancies
         WHERE invoice_id = %s
         ORDER BY id

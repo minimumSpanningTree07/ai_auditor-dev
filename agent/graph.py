@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -19,6 +18,7 @@ from agent.nodes.persistence import persist_invoice
 
 from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg
+from agent.config import settings
 
 
 # ---------------------------------------------------------------------
@@ -34,21 +34,18 @@ def build_checkpointer() -> Any:
     Build a PostgreSQL checkpointer so interrupted invoice workflows
     can be resumed after an API request or process restart.
 
-    DATABASE_URL must point to the PostgreSQL database used for
-    LangGraph checkpoint storage.
+    Use the same configured PostgreSQL connection as the audit database.
     """
     global _checkpointer, _checkpointer_connection
 
-    database_url = os.getenv("DATABASE_URL")
-
-    if not database_url:
-        raise RuntimeError(
-            "DATABASE_URL is required for durable human-review "
-            "pause/resume. Configure it before starting the agent."
-        )
-
+    # Use libpq keyword parameters instead of interpolating credentials into a URL.
+    # This safely supports passwords containing @, :, /, or other URL-reserved characters.
     _checkpointer_connection = psycopg.connect(
-        database_url,
+        host=settings.postgres_host,
+        port=settings.postgres_port,
+        dbname=settings.postgres_db,
+        user=settings.postgres_user,
+        password=settings.postgres_password,
         autocommit=True,
     )
 
@@ -143,12 +140,13 @@ def route_after_reporting(state: InvoiceState) -> str:
     return "persistence"
 
 def route_after_persistence(state: InvoiceState) -> str:
+    """Index every persisted invoice, including invoices requiring human review.
+
+    Human review is performed through the explicit revalidation API/UI. Pausing
+    the initial graph before indexing made manual-review invoices invisible to Ask AI.
+    """
     if state.get("persistence_status") != "persisted":
         return "end"
-
-    if state.get("human_review_required"):
-        return "human_review"
-
     return "rag_indexing"
 
 # def route_after_persistence(state: InvoiceState) -> str:
