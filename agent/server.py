@@ -1,21 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-
-
-import uuid
-
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
-
-
-logger = logging.getLogger(__name__)
-
 
 from agent.watcher import InvoiceWatcher
 from agent.config import settings
@@ -23,12 +16,16 @@ from agent.graph import process_invoice
 from agent.services.database import db
 from agent.services.erp_client import erp_client
 from agent.services.cache import cache
-
 logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=getattr(
+        logging,
+        str(settings.log_level).upper(),
+        logging.INFO,
+    ),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.app_name,
@@ -36,14 +33,26 @@ app = FastAPI(
 )
 
 INCOMING_DIR = Path("/app/data/incoming")
+
 SUPPORTED_EXTENSIONS = {
-    ".pdf", ".docx", ".png", ".jpg",
-    ".jpeg", ".tiff", ".tif",
+    ".pdf",
+    ".docx",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tiff",
+    ".tif",
 }
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 watcher = InvoiceWatcher(directory=INCOMING_DIR)
 watcher_task: asyncio.Task | None = None
 
+
+# ------------------------------------------------------------------
+# Request models
+# ------------------------------------------------------------------
 
 class RevalidationRequest(BaseModel):
     corrections: dict[str, Any] = Field(default_factory=dict)
@@ -51,11 +60,35 @@ class RevalidationRequest(BaseModel):
     feedback: str | None = None
 
 
+class QueryRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    invoice_id: str | None = None
+
+
+class QueryResponse(BaseModel):
+    question: str
+    invoice_id: str | None
+    answer: str
+    documents: list[dict[str, Any]] = Field(default_factory=list)
+    reflection: dict[str, Any] = Field(default_factory=dict)
+    accepted: bool = False
+    retry_count: int = 0
+# ------------------------------------------------------------------
+# Startup / shutdown
+# ------------------------------------------------------------------
+
 @app.on_event("startup")
 async def startup_event():
     global watcher_task
-    INCOMING_DIR.mkdir(parents=True, exist_ok=True)
-    watcher_task = asyncio.create_task(watcher.run())
+
+    INCOMING_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    watcher_task = asyncio.create_task(
+        watcher.run()
+    )
 
 
 @app.on_event("shutdown")
@@ -64,6 +97,7 @@ async def shutdown_event():
 
     if watcher_task is not None:
         watcher_task.cancel()
+
         try:
             await watcher_task
         except asyncio.CancelledError:
@@ -72,9 +106,9 @@ async def shutdown_event():
             watcher_task = None
 
 
-
-
-
+# ------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------
 
 @app.get("/health")
 def health() -> dict[str, Any]:
@@ -85,6 +119,10 @@ def health() -> dict[str, Any]:
         "redis": cache.health_check(),
     }
 
+
+# ------------------------------------------------------------------
+# Invoice APIs
+# ------------------------------------------------------------------
 
 @app.get("/api/invoices")
 def list_invoices() -> list[dict[str, Any]]:
@@ -113,7 +151,10 @@ def list_invoices() -> list[dict[str, Any]]:
 
 
 @app.get("/api/invoices/{invoice_id}")
-def get_invoice(invoice_id: str) -> dict[str, Any]:
+def get_invoice(
+    invoice_id: str,
+) -> dict[str, Any]:
+
     invoice = db.fetch_one(
         """
         SELECT *
@@ -162,52 +203,74 @@ def get_invoice(invoice_id: str) -> dict[str, Any]:
     return invoice
 
 
-INCOMING_DIR = Path("/app/data/incoming")
+# ------------------------------------------------------------------
+# Upload
+# ------------------------------------------------------------------
 
-SUPPORTED_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".tiff",
-    ".tif",
-}
-
-
-@app.post("/api/invoices/upload", status_code=202)
-async def upload_invoice(file: UploadFile = File(...)):
+@app.post(
+    "/api/invoices/upload",
+    status_code=202,
+)
+async def upload_invoice(
+    file: UploadFile = File(...),
+):
     """Save an invoice for asynchronous processing."""
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided.")
 
-    extension = Path(file.filename).suffix.lower()
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename provided.",
+        )
+
+    extension = Path(
+        file.filename
+    ).suffix.lower()
+
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported file type: {extension or 'unknown'}",
+            detail=(
+                f"Unsupported file type: "
+                f"{extension or 'unknown'}"
+            ),
         )
 
     destination: Path | None = None
 
     try:
-        INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+        INCOMING_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        safe_name = f"{uuid.uuid4().hex}{extension}"
-        destination = INCOMING_DIR / safe_name
+        safe_name = (
+            f"{uuid.uuid4().hex}{extension}"
+        )
+
+        destination = (
+            INCOMING_DIR / safe_name
+        )
+
         size = 0
 
         with destination.open("wb") as output:
             while True:
-                chunk = await file.read(1024 * 1024)
+                chunk = await file.read(
+                    1024 * 1024
+                )
+
                 if not chunk:
                     break
 
                 size += len(chunk)
+
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail="File exceeds the 25 MB upload limit.",
+                        detail=(
+                            "File exceeds the "
+                            "25 MB upload limit."
+                        ),
                     )
 
                 output.write(chunk)
@@ -219,46 +282,75 @@ async def upload_invoice(file: UploadFile = File(...)):
             )
 
         logger.info(
-            "Invoice uploaded: original=%s stored=%s bytes=%s",
+            "Invoice uploaded: original=%s "
+            "stored=%s bytes=%s",
             file.filename,
             safe_name,
             size,
         )
 
-        # InvoiceWatcher is responsible for processing files in this directory.
         return {
             "status": "queued",
             "filename": file.filename,
             "stored_filename": safe_name,
             "size_bytes": size,
-            "message": "Upload saved; awaiting invoice processing.",
+            "message": (
+                "Upload saved; awaiting "
+                "invoice processing."
+            ),
         }
 
     except HTTPException:
         if destination is not None:
-            destination.unlink(missing_ok=True)
+            destination.unlink(
+                missing_ok=True
+            )
         raise
 
     except Exception:
         if destination is not None:
-            destination.unlink(missing_ok=True)
+            destination.unlink(
+                missing_ok=True
+            )
 
-        logger.exception("Invoice upload failed for %r", file.filename)
+        logger.exception(
+            "Invoice upload failed for %r",
+            file.filename,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail="Upload failed. Check the API server logs.",
+            detail=(
+                "Upload failed. "
+                "Check the API server logs."
+            ),
         )
 
     finally:
         await file.close()
 
+@app.get("/api/dashboard/summary")
+def dashboard_summary():
+    try:
+        return db.get_dashboard_summary()
+    except Exception as exc:
+        logger.exception("Dashboard summary failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dashboard summary failed: {exc}",
+        )
+# ------------------------------------------------------------------
+# HITL / Revalidation
+# ------------------------------------------------------------------
 
-
-@app.post("/api/invoices/{invoice_id}/revalidate")
+@app.post(
+    "/api/invoices/{invoice_id}/revalidate"
+)
 def revalidate_invoice(
     invoice_id: str,
     request: RevalidationRequest,
 ) -> dict[str, Any]:
+
     invoice = db.fetch_one(
         """
         SELECT
@@ -277,71 +369,142 @@ def revalidate_invoice(
             detail="Invoice not found",
         )
 
-    file_path = Path(invoice["file_path"])
+    file_path = Path(
+        invoice["file_path"]
+    )
 
     if not file_path.exists():
         raise HTTPException(
             status_code=404,
-            detail="Original invoice file no longer exists",
+            detail=(
+                "Original invoice file "
+                "no longer exists"
+            ),
         )
 
     state = {
-    "invoice_id": invoice_id,
-    "file_path": str(file_path),
-    "file_name": invoice["file_name"],
-    "workflow_mode": "human_revalidation",
-    "thread_id": f"{invoice_id}:revalidation:{uuid.uuid4()}",
-    "force_revalidation": True,
-    "human_decision": request.decision,
-    "human_feedback": request.feedback,
-    "human_corrections": request.corrections,
+        "invoice_id": invoice_id,
+        "file_path": str(file_path),
+        "file_name": invoice["file_name"],
+        "workflow_mode": "human_revalidation",
+        "thread_id": (
+            f"{invoice_id}:revalidation:"
+            f"{uuid.uuid4()}"
+        ),
+        "force_revalidation": True,
+        "human_decision": request.decision,
+        "human_feedback": request.feedback,
+        "human_corrections": request.corrections,
     }
 
     result = process_invoice(state)
 
     return {
-        "status": result.get("processing_status"),
+        "status": result.get(
+            "processing_status"
+        ),
         "invoice_id": invoice_id,
-        "validation_status": result.get("validation_status"),
-        "recommendation": result.get("recommendation"),
+        "validation_status": result.get(
+            "validation_status"
+        ),
+        "recommendation": result.get(
+            "recommendation"
+        ),
         "human_review_required": result.get(
             "human_review_required"
         ),
-        "discrepancies": result.get("discrepancies", []),
-        "warnings": result.get("warnings", []),
-        "errors": result.get("errors", []),
+        "discrepancies": result.get(
+            "discrepancies",
+            [],
+        ),
+        "warnings": result.get(
+            "warnings",
+            [],
+        ),
+        "errors": result.get(
+            "errors",
+            [],
+        ),
+        "message": (
+            "Invoice revalidated successfully."
+        ),
     }
 
 
-@app.get("/api/dashboard/summary")
-def dashboard_summary() -> dict[str, Any]:
-    row = db.fetch_one(
-        """
-        SELECT
-            COUNT(*) AS total,
-            COUNT(*) FILTER (
-                WHERE validation_status = 'approved'
-            ) AS approved,
-            COUNT(*) FILTER (
-                WHERE validation_status = 'manual_review'
-            ) AS manual_review,
-            COUNT(*) FILTER (
-                WHERE validation_status = 'rejected'
-            ) AS rejected
-        FROM audit.invoices
-        """
-    )
+# ------------------------------------------------------------------
+# Dashboard
+# ------------------------------------------------------------------
+@app.post("/api/query", response_model=QueryResponse)
+def query_invoice(request: QueryRequest) -> dict[str, Any]:
+    """
+    Natural-language invoice query using the RAG pipeline.
 
-    return row or {
-        "total": 0,
-        "approved": 0,
-        "manual_review": 0,
-        "rejected": 0,
-    }
+    invoice_id is optional. When supplied, retrieval is restricted
+    to that invoice.
+    """
+
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty.",
+        )
+
+    if request.invoice_id:
+        invoice = db.fetch_one(
+            """
+            SELECT invoice_id
+            FROM audit.invoices
+            WHERE invoice_id = %s
+            """,
+            [request.invoice_id],
+        )
+
+        if not invoice:
+            raise HTTPException(
+                status_code=404,
+                detail="Selected invoice not found.",
+            )
+
+    try:
+        from agent.rag.pipeline import run_rag
+
+        result = run_rag(
+            question=question,
+            invoice_id=request.invoice_id,
+        )
+
+        return {
+            "question": question,
+            "invoice_id": request.invoice_id,
+            "answer": result.get("answer") or "No answer generated.",
+            "documents": result.get("documents", []),
+            "reflection": result.get("reflection", {}),
+            "accepted": bool(result.get("accepted", False)),
+            "retry_count": int(result.get("retry_count", 0)),
+        }
+
+    except Exception as exc:
+        logger.exception("RAG query failed")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"RAG query failed: {exc}",
+        ) from exc
 
 
-@app.get("/api/invoices/{invoice_id}/report")
-def get_invoice_report(invoice_id: str) -> dict[str, Any]:
+# ------------------------------------------------------------------
+# Report
+# ------------------------------------------------------------------
+
+@app.get(
+    "/api/invoices/{invoice_id}/report"
+)
+def get_invoice_report(
+    invoice_id: str,
+) -> dict[str, Any]:
+
     invoice = db.fetch_one(
         """
         SELECT report_path
@@ -357,7 +520,9 @@ def get_invoice_report(invoice_id: str) -> dict[str, Any]:
             detail="Invoice not found",
         )
 
-    report_path = invoice.get("report_path")
+    report_path = invoice.get(
+        "report_path"
+    )
 
     if not report_path:
         raise HTTPException(
@@ -374,16 +539,24 @@ def get_invoice_report(invoice_id: str) -> dict[str, Any]:
         )
 
     try:
-        import json
-
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to read report: {exc}",
+            detail=(
+                f"Unable to read report: {exc}"
+            ),
         ) from exc
 
+
+# ------------------------------------------------------------------
+# Local execution
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn

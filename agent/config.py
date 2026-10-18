@@ -368,13 +368,13 @@ def load_settings() -> Settings:
         # RAG answer generation
         rag_model=_get_env(
             "RAG_MODEL",
-            "bedrock/cohere.command-r-plus-v1",
+            "bedrock/amazon.nova-lite-v1:0",
         ),
 
         # Translation
         translation_model=_get_env(
             "TRANSLATION_MODEL",
-            "bedrock/cohere.command-r-plus-v1",
+            "bedrock/amazon.nova-lite-v1:0",
         ),
 
         llm_temperature=_get_float(

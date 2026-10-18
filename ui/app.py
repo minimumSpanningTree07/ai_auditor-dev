@@ -2,459 +2,586 @@ from __future__ import annotations
 
 import streamlit as st
 
-from api_client import api_client
+from api_client import (
+    AgentAPIError,
+    health,
+    get_dashboard_summary,
+    get_invoices,
+    get_invoice,
+    upload_invoice,
+    revalidate_invoice,
+    ask_ai,
+)
+
+from components.dashboard import render_dashboard
+from components.invoice_table import render_invoice_table
+from components.invoice_details import render_invoice_details
+from components.discrepancy_panel import render_discrepancy_panel
 
 
 st.set_page_config(
     page_title="AI Invoice Auditor",
-    page_icon="📄",
+    page_icon="🧾",
     layout="wide",
 )
 
 
-def safe_call(function, default):
+def main() -> None:
+
+    st.sidebar.title("AI Invoice Auditor")
+
     try:
-        return function()
-    except Exception as exc:
-        st.error(str(exc))
-        return default
+        health()
+        agent_online = True
+    except AgentAPIError:
+        agent_online = False
 
+    if agent_online:
+        st.sidebar.success("Agent Online")
+    else:
+        st.sidebar.error("Agent Offline")
 
-def status_badge(status: str | None) -> str:
-    value = (status or "unknown").lower()
-
-    if value == "approved":
-        return "🟢 Approved"
-
-    if value == "manual_review":
-        return "🟡 Manual Review"
-
-    if value == "rejected":
-        return "🔴 Rejected"
-
-    return "⚪ Unknown"
-
-
-st.title("AI Invoice Auditor")
-st.caption(
-    "Invoice extraction, ERP validation, discrepancy detection and RAG-assisted audit."
-)
-
-# ------------------------------------------------------------------
-# Sidebar
-# ------------------------------------------------------------------
-
-with st.sidebar:
-    st.header("Invoice Upload")
-
-    uploaded_file = st.file_uploader(
-        "Add a new invoice",
-        type=[
-            "pdf",
-            "png",
-            "jpg",
-            "jpeg",
-            "tif",
-            "tiff",
+    page = st.sidebar.radio(
+        "Navigation",
+        [
+            "Dashboard",
+            "Invoices",
+            "Upload Invoice",
+            "Ask AI",
         ],
     )
 
-    if uploaded_file is not None:
-        if st.button(
-            "Upload Invoice",
-            use_container_width=True,
-        ):
-            try:
-                result = api_client.upload_invoice(
-                    uploaded_file
-                )
+    if page == "Dashboard":
+        dashboard_page()
 
-                st.success(
-                    result.get(
-                        "message",
-                        "Invoice uploaded.",
-                    )
-                )
+    elif page == "Invoices":
+        invoices_page()
 
-                st.rerun()
+    elif page == "Upload Invoice":
+        upload_page()
 
-            except Exception as exc:
-                st.error(str(exc))
+    elif page == "Ask AI":
+        ask_ai_page()
 
-    st.divider()
 
-    if st.button(
-        "Refresh",
-        use_container_width=True,
+def dashboard_page() -> None:
+
+    st.title("AI Invoice Auditor")
+
+    try:
+        summary = get_dashboard_summary()
+        render_dashboard(summary)
+
+    except AgentAPIError as exc:
+        st.error(str(exc))
+
+
+def invoices_page() -> None:
+
+    st.title("Invoices")
+
+    try:
+        invoices = get_invoices()
+
+        selected_id = render_invoice_table(
+            invoices
+        )
+
+        if not selected_id:
+            return
+
+        invoice = get_invoice(selected_id)
+
+        st.divider()
+
+        render_invoice_details(invoice)
+
+        discrepancies = invoice.get(
+            "discrepancies",
+            [],
+        )
+
+        render_discrepancy_panel(
+            discrepancies
+        )
+
+        st.divider()
+
+        render_hitl(
+            invoice=invoice,
+            invoice_id=selected_id,
+        )
+
+    except AgentAPIError as exc:
+        st.error(str(exc))
+
+
+def render_hitl(
+    invoice: dict,
+    invoice_id: str,
+) -> None:
+
+    status = str(
+        invoice.get(
+            "validation_status",
+            "",
+        )
+    ).lower()
+
+    review_required = bool(
+        invoice.get(
+            "human_review_required",
+            False,
+        )
+    )
+
+    if (
+        status != "manual_review"
+        and not review_required
     ):
-        st.rerun()
+        st.success(
+            "No human review required."
+        )
+        return
 
-
-# ------------------------------------------------------------------
-# Dashboard
-# ------------------------------------------------------------------
-
-summary = safe_call(
-    api_client.dashboard_summary,
-    {
-        "total": 0,
-        "approved": 0,
-        "manual_review": 0,
-        "rejected": 0,
-    },
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Total Invoices",
-        summary.get("total", 0),
+    st.warning(
+        "Human review required"
     )
 
-with col2:
-    st.metric(
-        "Approved",
-        summary.get("approved", 0),
+    st.subheader(
+        "Human-in-the-Loop Review"
     )
 
-with col3:
-    st.metric(
-        "Manual Review",
-        summary.get("manual_review", 0),
+    st.caption(
+        "Review the extracted values, "
+        "correct discrepancies if required, "
+        "then revalidate the invoice."
     )
-
-with col4:
-    st.metric(
-        "Rejected",
-        summary.get("rejected", 0),
-    )
-
-st.divider()
-
-
-# ------------------------------------------------------------------
-# Invoice List
-# ------------------------------------------------------------------
-
-st.subheader("Invoices")
-
-invoices = safe_call(
-    api_client.get_invoices,
-    [],
-)
-
-if not invoices:
-    st.info(
-        "No invoices available. Upload an invoice to begin."
-    )
-    st.stop()
-
-
-invoice_labels = {
-    invoice.get("invoice_id"): (
-        f"{invoice.get('invoice_number') or 'Unknown'}"
-        f" — "
-        f"{invoice.get('vendor_name') or 'Unknown Vendor'}"
-    )
-    for invoice in invoices
-}
-
-selected_id = st.selectbox(
-    "Select Invoice",
-    options=list(invoice_labels.keys()),
-    format_func=lambda value: invoice_labels[value],
-)
-
-selected = next(
-    (
-        invoice
-        for invoice in invoices
-        if invoice.get("invoice_id") == selected_id
-    ),
-    None,
-)
-
-if selected:
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        st.write("**Invoice**")
-        st.write(
-            selected.get(
-                "invoice_number",
-                "-",
-            )
-        )
-
-    with c2:
-        st.write("**Vendor**")
-        st.write(
-            selected.get(
-                "vendor_name",
-                "-",
-            )
-        )
-
-    with c3:
-        st.write("**PO**")
-        st.write(
-            selected.get(
-                "po_number",
-                "-",
-            )
-        )
-
-    with c4:
-        st.write("**Status**")
-        st.write(
-            status_badge(
-                selected.get(
-                    "validation_status"
-                )
-            )
-        )
-
-
-# ------------------------------------------------------------------
-# Invoice Details
-# ------------------------------------------------------------------
-
-try:
-    invoice = api_client.get_invoice(
-        selected_id
-    )
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
-
-tab_details, tab_discrepancies, tab_feedback = st.tabs(
-    [
-        "Invoice Details",
-        "Discrepancies",
-        "Human Review",
-    ]
-)
-
-
-with tab_details:
-    st.subheader("Invoice Information")
-
-    left, right = st.columns(2)
-
-    with left:
-        st.write(
-            "**Invoice Number:**",
-            invoice.get("invoice_number") or "-",
-        )
-        st.write(
-            "**Vendor:**",
-            invoice.get("vendor_name") or "-",
-        )
-        st.write(
-            "**PO Number:**",
-            invoice.get("po_number") or "-",
-        )
-        st.write(
-            "**Invoice Date:**",
-            invoice.get("invoice_date") or "-",
-        )
-
-    with right:
-        st.write(
-            "**Currency:**",
-            invoice.get("currency") or "-",
-        )
-        st.write(
-            "**Subtotal:**",
-            invoice.get("subtotal_amount") or "-",
-        )
-        st.write(
-            "**Tax:**",
-            invoice.get("tax_amount") or "-",
-        )
-        st.write(
-            "**Total:**",
-            invoice.get("total_amount") or "-",
-        )
-
-    st.subheader("Line Items")
 
     line_items = invoice.get(
         "line_items",
         [],
     )
 
+    corrections = {
+        "line_items": []
+    }
+
     if line_items:
-        st.dataframe(
-            line_items,
-            use_container_width=True,
-            hide_index=True,
+
+        st.markdown(
+            "### Correct Line Items"
         )
-    else:
-        st.info("No line items available.")
 
-    st.subheader("Recommendation")
+        for index, item in enumerate(
+            line_items
+        ):
 
-    st.info(
-        invoice.get(
-            "recommendation",
-            "No recommendation available.",
-        )
-    )
+            sku = (
+                item.get("sku")
+                or item.get("sku_code")
+                or item.get("product_code")
+                or ""
+            )
 
+            st.markdown(
+                f"**{sku}**"
+            )
 
-with tab_discrepancies:
-    discrepancies = invoice.get(
-        "discrepancies",
-        [],
-    )
+            col1, col2 = st.columns(2)
 
-    if not discrepancies:
-        st.success(
-            "No discrepancies recorded."
-        )
-    else:
-        for discrepancy in discrepancies:
-            severity = str(
-                discrepancy.get(
-                    "severity",
-                    "warning",
+            original_quantity = float(
+                item.get(
+                    "quantity",
+                    0,
+                ) or 0
+            )
+
+            original_unit_price = float(
+                item.get(
+                    "unit_price",
+                    0,
+                ) or 0
+            )
+
+            with col1:
+
+                quantity = st.number_input(
+                    "Quantity",
+                    min_value=0.0,
+                    value=original_quantity,
+                    step=1.0,
+                    key=f"qty_{invoice_id}_{index}",
                 )
-            ).upper()
 
-            st.warning(
-                f"{severity}: "
-                f"{discrepancy.get('message', 'Discrepancy detected')}"
-            )
+            with col2:
 
-            details = discrepancy.get(
-                "details"
-            )
+                unit_price = st.number_input(
+                    "Unit Price",
+                    min_value=0.0,
+                    value=original_unit_price,
+                    step=0.01,
+                    format="%.2f",
+                    key=f"price_{invoice_id}_{index}",
+                )
 
-            if details:
-                st.json(details)
+            correction = {
+                "sku": sku,
+            }
 
+            changed = False
 
-with tab_feedback:
-    st.subheader("Human Review")
+            if quantity != original_quantity:
+                correction["quantity"] = quantity
+                changed = True
 
-    current_status = invoice.get(
-        "validation_status"
-    )
+            if unit_price != original_unit_price:
+                correction["unit_price"] = unit_price
+                changed = True
 
-    st.write(
-        f"Current status: "
-        f"**{status_badge(current_status)}**"
+            if changed:
+                corrections["line_items"].append(
+                    correction
+                )
+
+    feedback = st.text_area(
+        "Auditor feedback",
+        placeholder=(
+            "Explain the correction or "
+            "review decision..."
+        ),
+        key=f"feedback_{invoice_id}",
     )
 
     decision = st.selectbox(
         "Decision",
         [
-            "approved",
-            "manual_review",
-            "rejected",
+            "Correct & Revalidate",
+            "Approve",
+            "Reject",
         ],
+        key=f"decision_{invoice_id}",
     )
-
-    feedback = st.text_area(
-        "Feedback",
-        placeholder=(
-            "Explain the correction or review decision..."
-        ),
-    )
-
-    st.markdown("### Corrections")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        corrected_vendor = st.text_input(
-            "Vendor",
-            value=invoice.get(
-                "vendor_name"
-            ) or "",
-        )
-
-        corrected_invoice_number = st.text_input(
-            "Invoice Number",
-            value=invoice.get(
-                "invoice_number"
-            ) or "",
-        )
-
-        corrected_po = st.text_input(
-            "PO Number",
-            value=invoice.get(
-                "po_number"
-            ) or "",
-        )
-
-    with col2:
-        corrected_currency = st.text_input(
-            "Currency",
-            value=invoice.get(
-                "currency"
-            ) or "",
-        )
-
-        corrected_total = st.text_input(
-            "Total Amount",
-            value=str(
-                invoice.get(
-                    "total_amount"
-                ) or ""
-            ),
-        )
 
     if st.button(
-        "Submit Review & Revalidate",
+        "Submit Human Review",
         type="primary",
-        use_container_width=True,
+        key=f"submit_hitl_{invoice_id}",
     ):
-        corrections = {
-            "vendor_name": corrected_vendor,
-            "invoice_number": corrected_invoice_number,
-            "po_number": corrected_po,
-            "currency": corrected_currency,
-            "total_amount": corrected_total,
-        }
+
+        if decision == "Correct & Revalidate":
+
+            api_decision = "corrected"
+
+        elif decision == "Approve":
+
+            api_decision = "approved"
+
+        else:
+
+            api_decision = "rejected"
+
+        correction_payload = {}
+
+        if corrections["line_items"]:
+            correction_payload[
+                "line_items"
+            ] = corrections["line_items"]
 
         try:
-            result = api_client.revalidate_invoice(
-                invoice_id=selected_id,
-                corrections=corrections,
-                decision=decision,
-                feedback=feedback,
-            )
+
+            with st.spinner(
+                "Applying human review and revalidating..."
+            ):
+
+                result = revalidate_invoice(
+                    invoice_id=invoice_id,
+                    corrections=correction_payload,
+                    decision=api_decision,
+                    feedback=feedback.strip() or None,
+                )
 
             st.success(
-                "Invoice revalidated successfully."
+                "Human review submitted successfully."
             )
 
             st.json(result)
 
             st.rerun()
 
-        except Exception as exc:
+        except AgentAPIError as exc:
+
             st.error(str(exc))
 
 
-# ------------------------------------------------------------------
-# Existing Feedback
-# ------------------------------------------------------------------
+def upload_page() -> None:
 
-feedback_items = invoice.get(
-    "feedback",
-    [],
-)
+    st.title("Upload Invoice")
 
-if feedback_items:
-    st.divider()
-    st.subheader("Review History")
-
-    st.dataframe(
-        feedback_items,
-        use_container_width=True,
-        hide_index=True,
+    st.caption(
+        "Supported formats: PDF, DOCX and PNG"
     )
+
+    uploaded_file = st.file_uploader(
+        "Choose an invoice",
+        type=[
+            "pdf",
+            "docx",
+            "png",
+        ],
+    )
+
+    if uploaded_file is None:
+        return
+
+    st.info(
+        f"Selected: {uploaded_file.name}"
+    )
+
+    if st.button(
+        "Upload Invoice",
+        type="primary",
+    ):
+
+        try:
+
+            with st.spinner(
+                "Uploading invoice..."
+            ):
+
+                result = upload_invoice(
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                )
+
+            st.success(
+                result.get(
+                    "message",
+                    "Invoice uploaded successfully.",
+                )
+            )
+
+            st.json(result)
+
+        except AgentAPIError as exc:
+
+            st.error(str(exc))
+
+
+def ask_ai_page() -> None:
+
+    st.title("Ask AI")
+
+    st.caption(
+        "Ask questions about invoices and audit results using RAG."
+    )
+
+    try:
+
+        invoices = get_invoices()
+
+    except AgentAPIError as exc:
+
+        st.error(str(exc))
+        return
+
+    invoice_options = [
+        {
+            "label": "All invoices",
+            "id": None,
+        }
+    ]
+
+    seen_numbers = set()
+
+    for invoice in invoices:
+
+        invoice_number = (
+            invoice.get("invoice_number")
+            or invoice.get("file_name")
+            or "Unknown"
+        )
+
+        invoice_id = invoice.get(
+            "invoice_id"
+        )
+
+        if not invoice_id:
+            continue
+
+        # Avoid duplicate invoice-number entries.
+        if invoice_number in seen_numbers:
+            continue
+
+        seen_numbers.add(invoice_number)
+
+        invoice_options.append(
+            {
+                "label": str(invoice_number),
+                "id": invoice_id,
+            }
+        )
+
+    selected_invoice = st.selectbox(
+        "Invoice",
+        options=invoice_options,
+        format_func=lambda item: item["label"],
+    )
+
+    question = st.text_area(
+        "Question",
+        placeholder=(
+            "Examples:\n"
+            "• What is the total amount?\n"
+            "• What discrepancies were found?\n"
+            "• Why was this invoice sent for manual review?\n"
+            "• What is the PO number?"
+        ),
+        height=120,
+    )
+
+    if st.button(
+        "Ask AI",
+        type="primary",
+    ):
+
+        if not question.strip():
+
+            st.warning(
+                "Please enter a question."
+            )
+
+            return
+
+        try:
+
+            with st.spinner(
+                "Searching invoices and generating answer..."
+            ):
+
+                result = ask_ai(
+                    question=question.strip(),
+                    invoice_id=selected_invoice[
+                        "id"
+                    ],
+                )
+
+            st.subheader(
+                "Answer"
+            )
+
+            st.success(
+                result.get(
+                    "answer",
+                    "No answer returned.",
+                )
+            )
+
+            reflection = result.get(
+                "reflection",
+                {},
+            )
+
+            if reflection:
+
+                st.divider()
+
+                st.subheader(
+                    "RAG Evaluation"
+                )
+
+                col1, col2, col3, col4 = st.columns(
+                    4
+                )
+
+                with col1:
+                    st.metric(
+                        "Context Relevance",
+                        round(
+                            float(
+                                reflection.get(
+                                    "context_relevance",
+                                    0,
+                                )
+                            ),
+                            3,
+                        ),
+                    )
+
+                with col2:
+                    st.metric(
+                        "Groundedness",
+                        round(
+                            float(
+                                reflection.get(
+                                    "groundedness",
+                                    0,
+                                )
+                            ),
+                            3,
+                        ),
+                    )
+
+                with col3:
+                    st.metric(
+                        "Question Relevance",
+                        round(
+                            float(
+                                reflection.get(
+                                    "question_relevance",
+                                    0,
+                                )
+                            ),
+                            3,
+                        ),
+                    )
+
+                with col4:
+
+                    overall = float(
+                        reflection.get(
+                            "overall_score",
+                            0,
+                        )
+                    )
+
+                    if overall > 0.7:
+                        st.metric(
+                            "Overall",
+                            f"{overall:.3f}",
+                        )
+                    else:
+                        st.metric(
+                            "Overall",
+                            f"{overall:.3f}",
+                            delta="Below threshold",
+                        )
+
+                reason = reflection.get(
+                    "reason"
+                )
+
+                if reason:
+
+                    st.caption(
+                        f"Evaluation: {reason}"
+                    )
+
+            retry_count = result.get(
+                "retry_count",
+                0,
+            )
+
+            if retry_count:
+
+                st.caption(
+                    f"RAG retries used: {retry_count}"
+                )
+
+        except AgentAPIError as exc:
+
+            st.error(str(exc))
+
+
+if __name__ == "__main__":
+    main()

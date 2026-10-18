@@ -15,9 +15,9 @@ def _build_reflection_prompt(
     answer: str,
 ) -> str:
     return f"""
-You are evaluating an AI invoice-auditing RAG answer.
+You are evaluating an AI-generated answer for an invoice-auditing RAG system.
 
-Evaluate the answer using the RAG Triad:
+Evaluate the answer using the RAG Triad.
 
 1. Context relevance:
    Does the retrieved context contain information relevant
@@ -28,19 +28,21 @@ Evaluate the answer using the RAG Triad:
    Penalize claims that are invented or unsupported.
 
 3. Question relevance:
-   Does the answer actually answer the user's question?
+   Does the answer directly answer the user's question?
 
 Give each score from 0.0 to 1.0.
 
-Return ONLY valid JSON in this exact structure:
+Return ONLY valid JSON with exactly these fields:
 
 {{
   "context_relevance": 0.0,
   "groundedness": 0.0,
   "question_relevance": 0.0,
-  "overall_score": 0.0,
   "reason": "short explanation"
 }}
+
+Do NOT provide an overall_score.
+The application will calculate it deterministically.
 
 QUESTION:
 {question}
@@ -55,12 +57,12 @@ GENERATED ANSWER:
 
 def _extract_json(text: str) -> dict[str, Any]:
     """
-    Extract JSON even if the model accidentally surrounds it
-    with markdown fences or additional whitespace.
+    Extract a JSON object from the model response.
+    Handles plain JSON and markdown/code-fence responses.
     """
-
     text = text.strip()
 
+    # First try the entire response.
     try:
         value = json.loads(text)
 
@@ -70,6 +72,7 @@ def _extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    # Then find the first JSON object.
     match = re.search(
         r"\{.*\}",
         text,
@@ -78,10 +81,15 @@ def _extract_json(text: str) -> dict[str, Any]:
 
     if not match:
         raise ValueError(
-            "Reflection model did not return JSON."
+            "Reflection model did not return valid JSON."
         )
 
-    value = json.loads(match.group(0))
+    try:
+        value = json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON returned by reflection model: {exc}"
+        ) from exc
 
     if not isinstance(value, dict):
         raise ValueError(
@@ -91,9 +99,10 @@ def _extract_json(text: str) -> dict[str, Any]:
     return value
 
 
-def _score(
-    value: Any,
-) -> float:
+def _score(value: Any) -> float:
+    """
+    Normalize a score to the range [0.0, 1.0].
+    """
     try:
         score = float(value)
     except (TypeError, ValueError):
@@ -130,6 +139,7 @@ def _evaluate(
 
     content = response.choices[0].message.content
 
+    # Nova responses can sometimes contain structured content.
     if isinstance(content, list):
         content = "".join(
             str(
@@ -156,29 +166,22 @@ def _evaluate(
         result.get("question_relevance")
     )
 
-    supplied_overall = result.get(
-        "overall_score"
-    )
-
-    if supplied_overall is None:
-        overall_score = (
-            context_relevance
-            + groundedness
-            + question_relevance
-        ) / 3.0
-    else:
-        overall_score = _score(
-            supplied_overall
-        )
+    # IMPORTANT:
+    # Never trust the LLM to calculate the final score.
+    overall_score = (
+        context_relevance
+        + groundedness
+        + question_relevance
+    ) / 3.0
 
     return {
         "context_relevance": context_relevance,
         "groundedness": groundedness,
         "question_relevance": question_relevance,
-        "overall_score": overall_score,
+        "overall_score": round(overall_score, 4),
         "reason": str(
             result.get("reason") or ""
-        ),
+        ).strip(),
     }
 
 
@@ -189,22 +192,46 @@ def reflect(
 ) -> dict[str, Any]:
     """
     Evaluate a generated RAG answer using the RAG Triad.
+
+    Acceptance:
+        overall_score > rag_score_threshold
     """
 
     if not question.strip():
         return {
+            "context_relevance": 0.0,
+            "groundedness": 0.0,
+            "question_relevance": 0.0,
+            "overall_score": 0.0,
+            "reason": "Question is empty.",
+            "accepted": False,
+            "rag_answer_accepted": False,
             "reflection_failed": True,
             "reflection_error": "Question is empty.",
         }
 
     if not context.strip():
         return {
+            "context_relevance": 0.0,
+            "groundedness": 0.0,
+            "question_relevance": 0.0,
+            "overall_score": 0.0,
+            "reason": "Context is empty.",
+            "accepted": False,
+            "rag_answer_accepted": False,
             "reflection_failed": True,
             "reflection_error": "Context is empty.",
         }
 
     if not answer.strip():
         return {
+            "context_relevance": 0.0,
+            "groundedness": 0.0,
+            "question_relevance": 0.0,
+            "overall_score": 0.0,
+            "reason": "Answer is empty.",
+            "accepted": False,
+            "rag_answer_accepted": False,
             "reflection_failed": True,
             "reflection_error": "Answer is empty.",
         }
@@ -216,24 +243,34 @@ def reflect(
             answer=answer,
         )
 
+        threshold = float(
+            settings.rag_score_threshold
+        )
+
         accepted = (
-            result["overall_score"]
-            >= settings.rag_score_threshold
+            result["overall_score"] > threshold
         )
 
         return {
             **result,
-            "reflection_failed": False,
+            "accepted": accepted,
             "rag_answer_accepted": accepted,
+            "reflection_failed": False,
         }
 
     except Exception as exc:
+        error = f"Reflection failed: {exc}"
+
         return {
-            "reflection_failed": True,
+            "context_relevance": 0.0,
+            "groundedness": 0.0,
+            "question_relevance": 0.0,
+            "overall_score": 0.0,
+            "reason": error,
+            "accepted": False,
             "rag_answer_accepted": False,
-            "reflection_error": (
-                f"Reflection failed: {exc}"
-            ),
+            "reflection_failed": True,
+            "reflection_error": error,
         }
 
 
@@ -241,8 +278,7 @@ def reflect_state(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Run reflection against the answer currently stored
-    in workflow state.
+    LangGraph-compatible reflection node.
     """
 
     question = str(
@@ -277,7 +313,7 @@ def reflect_state(
             "overall_score"
         ),
         "rag_answer_accepted": result.get(
-            "rag_answer_accepted",
+            "accepted",
             False,
         ),
     }

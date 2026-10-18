@@ -292,6 +292,115 @@ class Database:
                 f"Database fetch_one failed: {exc}"
             ) from exc
 
+        # ============================================================
+    # DASHBOARD SUMMARY
+    # ============================================================
+
+    def get_dashboard_summary(self) -> dict[str, Any]:
+        """
+        Return aggregate statistics used by the Streamlit dashboard.
+
+        Uses the existing fetch_one() abstraction rather than opening
+        another PostgreSQL connection.
+        """
+
+        try:
+            invoice_stats = self.fetch_one(
+                """
+                SELECT
+                    COUNT(*) AS total_invoices,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(recommendation, '')) IN
+                        ('approve', 'approved')
+                    ) AS approved_invoices,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(recommendation, '')) IN
+                        ('manual_review', 'review', 'manual review')
+                    ) AS review_invoices,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(recommendation, '')) IN
+                        ('reject', 'rejected')
+                    ) AS rejected_invoices,
+
+                    COUNT(*) FILTER (
+                        WHERE human_review_required = TRUE
+                    ) AS pending_review,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(validation_status, '')) = 'passed'
+                    ) AS passed_validation,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(validation_status, '')) = 'failed'
+                    ) AS failed_validation
+
+                FROM audit.invoices
+                """
+            ) or {}
+
+            discrepancy_stats = self.fetch_one(
+                """
+                SELECT
+                    COUNT(*) AS total_discrepancies,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(status, '')) = 'open'
+                    ) AS open_discrepancies,
+
+                    COUNT(*) FILTER (
+                        WHERE LOWER(COALESCE(severity, '')) = 'high'
+                    ) AS high_severity_discrepancies
+
+                FROM audit.discrepancies
+                """
+            ) or {}
+
+            return {
+                "total_invoices": int(
+                    invoice_stats.get("total_invoices", 0) or 0
+                ),
+                "approved_invoices": int(
+                    invoice_stats.get("approved_invoices", 0) or 0
+                ),
+                "review_invoices": int(
+                    invoice_stats.get("review_invoices", 0) or 0
+                ),
+                "rejected_invoices": int(
+                    invoice_stats.get("rejected_invoices", 0) or 0
+                ),
+                "pending_review": int(
+                    invoice_stats.get("pending_review", 0) or 0
+                ),
+                "passed_validation": int(
+                    invoice_stats.get("passed_validation", 0) or 0
+                ),
+                "failed_validation": int(
+                    invoice_stats.get("failed_validation", 0) or 0
+                ),
+                "total_discrepancies": int(
+                    discrepancy_stats.get("total_discrepancies", 0) or 0
+                ),
+                "open_discrepancies": int(
+                    discrepancy_stats.get("open_discrepancies", 0) or 0
+                ),
+                "high_severity_discrepancies": int(
+                    discrepancy_stats.get(
+                        "high_severity_discrepancies", 0
+                    ) or 0
+                ),
+            }
+
+        except DatabaseErrorHandler:
+            raise
+
+        except Exception as exc:
+            raise DatabaseErrorHandler(
+                f"Database dashboard summary failed: {exc}"
+            ) from exc
+
     # ============================================================
     # FETCH ALL
     # ============================================================

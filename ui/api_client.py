@@ -8,104 +8,142 @@ import requests
 
 AGENT_URL = os.getenv(
     "AGENT_URL",
-    "http://agent:8000",
-)
+    "http://localhost:8000",
+).rstrip("/")
 
 
-class APIClient:
-    def __init__(
-        self,
-        base_url: str = AGENT_URL,
-        timeout: int = 30,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+class AgentAPIError(Exception):
+    pass
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        **kwargs: Any,
-    ) -> Any:
+
+def _request(
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> Any:
+
+    url = f"{AGENT_URL}{path}"
+
+    try:
         response = requests.request(
             method,
-            f"{self.base_url}{path}",
-            timeout=self.timeout,
+            url,
+            timeout=120,
             **kwargs,
         )
+    except requests.RequestException as exc:
+        raise AgentAPIError(
+            f"Unable to connect to Agent API: {exc}"
+        ) from exc
 
-        response.raise_for_status()
+    if not response.ok:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+
+        raise AgentAPIError(
+            f"Agent API returned {response.status_code}: {detail}"
+        )
+
+    if not response.content:
+        return {}
+
+    try:
         return response.json()
-
-    def health(self) -> dict[str, Any]:
-        return self._request("GET", "/health")
-
-    def dashboard_summary(self) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            "/api/dashboard/summary",
-        )
-
-    def get_invoices(self) -> list[dict[str, Any]]:
-        return self._request(
-            "GET",
-            "/api/invoices",
-        )
-
-    def get_invoice(
-        self,
-        invoice_id: str,
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/invoices/{invoice_id}",
-        )
-
-    def upload_invoice(
-        self,
-        file,
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            "/api/invoices/upload",
-            files={
-                "file": (
-                    file.name,
-                    file,
-                    getattr(
-                        file,
-                        "type",
-                        "application/octet-stream",
-                    ),
-                )
-            },
-        )
-
-    def revalidate_invoice(
-        self,
-        invoice_id: str,
-        corrections: dict[str, Any] | None = None,
-        decision: str | None = None,
-        feedback: str | None = None,
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"/api/invoices/{invoice_id}/revalidate",
-            json={
-                "corrections": corrections or {},
-                "decision": decision,
-                "feedback": feedback,
-            },
-        )
-
-    def get_report(
-        self,
-        invoice_id: str,
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/invoices/{invoice_id}/report",
-        )
+    except Exception:
+        return response.text
 
 
-api_client = APIClient()
+def health() -> dict[str, Any]:
+    return _request(
+        "GET",
+        "/health",
+    )
+
+
+def get_dashboard_summary() -> dict[str, Any]:
+    return _request(
+        "GET",
+        "/api/dashboard/summary",
+    )
+
+
+def get_invoices() -> list[dict[str, Any]]:
+    return _request(
+        "GET",
+        "/api/invoices",
+    )
+
+
+def get_invoice(
+    invoice_id: str,
+) -> dict[str, Any]:
+
+    return _request(
+        "GET",
+        f"/api/invoices/{invoice_id}",
+    )
+
+
+def get_report(
+    invoice_id: str,
+) -> dict[str, Any]:
+
+    return _request(
+        "GET",
+        f"/api/invoices/{invoice_id}/report",
+    )
+
+
+def upload_invoice(
+    filename: str,
+    content: bytes,
+) -> dict[str, Any]:
+
+    return _request(
+        "POST",
+        "/api/invoices/upload",
+        files={
+            "file": (
+                filename,
+                content,
+                "application/octet-stream",
+            )
+        },
+    )
+
+
+def revalidate_invoice(
+    invoice_id: str,
+    corrections: dict[str, Any] | None = None,
+    decision: str | None = None,
+    feedback: str | None = None,
+) -> dict[str, Any]:
+
+    return _request(
+        "POST",
+        f"/api/invoices/{invoice_id}/revalidate",
+        json={
+            "corrections": corrections or {},
+            "decision": decision,
+            "feedback": feedback,
+        },
+    )
+
+
+def ask_ai(
+    question: str,
+    invoice_id: str | None = None,
+) -> dict[str, Any]:
+
+    payload = {
+        "question": question,
+        "invoice_id": invoice_id,
+    }
+
+    return _request(
+        "POST",
+        "/api/query",
+        json=payload,
+    )
