@@ -23,3 +23,7 @@ langchain-qdrant
 python-multipart
 PyMuPDF
 langdetect
+
+# RAG quality evaluation (run explicitly with python -m agent.rag.evaluate)
+ragas==0.2.15
+langchain-community>=0.3,<0.4

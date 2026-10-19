@@ -37,3 +37,25 @@ The init scripts run only for a brand-new PostgreSQL data directory. If your cur
 To remove prior invoice audit records/files and the invoice RAG collection while preserving ERP seed data and AWS configuration, run `bash scripts/reset_invoice_data.sh` and type `RESET-INVOICES` when prompted. This is destructive for invoice audit history; back up first if needed. It does not remove PostgreSQL or Docker volumes.
 
 The Upload Invoice page shows queued, processing, and processed status. The Invoices page provides revalidation and human-feedback history for all invoices, not only those currently marked for manual review.
+
+## RAG quality evaluation (Ragas)
+
+The project includes an optional Ragas evaluation runner. It evaluates the existing Qdrant retrieval and LiteLLM answer-generation path; it does not replace either component. The evaluator uses the configured `RAG_MODEL` as its judge and the configured `EMBEDDING_MODEL` for answer-relevancy embeddings, so the same provider credentials/permissions are required.
+
+1. Edit `agent/rag/evaluation_dataset.jsonl` and replace each starter `reference` with a **specific, verified expected answer** from your invoice/policy corpus. Add `invoice_id` to a row when the question should be scoped to one invoice. The shipped references are starter templates, not a gold-standard benchmark.
+2. Rebuild the agent image so the optional evaluation dependencies are installed:
+
+   ```bash
+   docker compose build agent
+   docker compose up -d agent
+   ```
+
+3. Run evaluation from the project root inside the agent container:
+
+   ```bash
+   docker compose exec agent python -m agent.rag.evaluate \
+     --dataset agent/rag/evaluation_dataset.jsonl \
+     --output outputs/rag_eval_results.csv
+   ```
+
+The command writes per-question scores to `outputs/rag_eval_results.csv` and aggregate mean scores to `outputs/rag_eval_results.summary.json`. Metrics are Faithfulness, Response Relevancy, Context Precision, and Context Recall. Evaluation makes model/API calls and may incur provider charges; it requires a populated Qdrant collection and valid model credentials. It is an explicit command and does not run on every invoice audit.

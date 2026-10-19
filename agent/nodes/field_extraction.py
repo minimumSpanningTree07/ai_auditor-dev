@@ -516,53 +516,26 @@ def _apply_corrections(
 
                 matched_index = None
 
-                # ----------------------------------------------------
-                # Match by SKU first
-                # ----------------------------------------------------
-                if correction_sku:
+                # Line number is stable when the SKU itself is being edited.
+                # Prefer it to the proposed SKU to avoid appending a duplicate.
+                if correction_line_number is not None:
+                    try:
+                        requested_line = int(correction_line_number)
+                    except (TypeError, ValueError):
+                        requested_line = None
+                    if requested_line is not None and 1 <= requested_line <= len(merged_lines):
+                        matched_index = requested_line - 1
 
-                    normalized_correction_sku = normalize_sku(
-                        correction_sku
-                    )
-
+                if matched_index is None and correction_sku:
+                    normalized_correction_sku = normalize_sku(correction_sku)
                     for index, line in enumerate(merged_lines):
-
                         if not isinstance(line, dict):
                             continue
-
                         line_sku = (
-                            line.get("item_code")
-                            or line.get("sku")
-                            or line.get("sku_code")
-                            or line.get("product_code")
+                            line.get("item_code") or line.get("sku")
+                            or line.get("sku_code") or line.get("product_code")
                         )
-
-                        if (
-                            line_sku
-                            and normalize_sku(line_sku)
-                            == normalized_correction_sku
-                        ):
-                            matched_index = index
-                            break
-
-                # ----------------------------------------------------
-                # Fall back to line number
-                # ----------------------------------------------------
-                if (
-                    matched_index is None
-                    and correction_line_number is not None
-                ):
-
-                    for index, line in enumerate(merged_lines):
-
-                        if not isinstance(line, dict):
-                            continue
-
-                        if (
-                            line.get("line_number")
-                            == correction_line_number
-                            or index + 1 == correction_line_number
-                        ):
+                        if line_sku and normalize_sku(line_sku) == normalized_correction_sku:
                             matched_index = index
                             break
 
@@ -748,7 +721,19 @@ def extract_fields(state: dict[str, Any]) -> dict[str, Any]:
         corrections = state.get("human_corrections") or {}
         effective = _apply_corrections(extracted_values, corrections)
 
-        missing_fields = list(invoice.missing_fields)
+        required_after_correction = {
+            "invoice_number": effective.get("invoice_number"),
+            "vendor_name": effective.get("vendor_name"),
+            "invoice_date": effective.get("invoice_date"),
+            "currency": effective.get("currency"),
+            "total_amount": effective.get("total_amount"),
+            "line_items": effective.get("line_items"),
+        }
+        missing_fields = [
+            field for field, value in required_after_correction.items()
+            if value is None or (isinstance(value, str) and not value.strip())
+            or (field == "line_items" and not value)
+        ]
         review_reasons = list(invoice.review_reasons)
 
         if missing_fields:

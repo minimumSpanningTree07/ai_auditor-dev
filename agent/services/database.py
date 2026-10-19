@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Any, Generator, Iterable
+import threading
 
 from psycopg2 import DatabaseError
 from psycopg2 import pool
@@ -47,6 +48,7 @@ class Database:
 
     def __init__(self) -> None:
         self._pool: pool.ThreadedConnectionPool | None = None
+        self._transaction_local = threading.local()
 
     # ============================================================
     # CONNECTION CONFIGURATION
@@ -133,6 +135,14 @@ class Database:
         The connection is always returned to the pool.
         """
 
+        # Nested db.execute()/execute_many() calls reuse the outer transaction
+        # connection. This lets repository operations be atomic without
+        # changing every existing query call site.
+        active_connection = getattr(self._transaction_local, "connection", None)
+        if active_connection is not None:
+            yield active_connection
+            return
+
         connection_pool = self._get_pool()
         connection = None
 
@@ -176,6 +186,13 @@ class Database:
         Otherwise it is committed.
         """
 
+        active_connection = getattr(self._transaction_local, "connection", None)
+        if active_connection is not None:
+            # A repository operation is already running inside an outer
+            # transaction; do not commit or release that connection here.
+            yield active_connection
+            return
+
         connection_pool = self._get_pool()
         connection = None
 
@@ -187,6 +204,7 @@ class Database:
                     "Unable to obtain PostgreSQL connection."
                 )
 
+            self._transaction_local.connection = connection
             yield connection
 
             connection.commit()
@@ -208,7 +226,7 @@ class Database:
             raise
 
         finally:
-
+            self._transaction_local.connection = None
             if connection is not None:
                 connection_pool.putconn(connection)
 

@@ -215,7 +215,7 @@ def _build_effective_line_items(
     return line_items
 
 
-def persist_invoice(
+def _persist_invoice_impl(
     state: dict[str, Any],
 ) -> dict[str, Any]:
 
@@ -500,64 +500,44 @@ def persist_invoice(
         # Discrepancies
         # --------------------------------------------------------
 
+        discrepancies = state.get("discrepancies") or []
+
+        # Keep discrepancy IDs/history stable across revalidation. First mark
+        # the currently-open findings resolved, then reactivate/update matching
+        # findings from this validation pass. Findings still present remain open;
+        # findings no longer produced by validation stay in history as resolved.
+        existing_open = db.fetch_all(
+            "SELECT id, discrepancy_type, message FROM audit.discrepancies WHERE invoice_id = %s AND UPPER(status) = 'OPEN' ORDER BY id",
+            [invoice_id],
+        )
         db.execute(
-            """
-            DELETE FROM audit.discrepancies
-            WHERE invoice_id = %s
-            """,
+            "UPDATE audit.discrepancies SET status = 'resolved' WHERE invoice_id = %s AND UPPER(status) = 'OPEN'",
             [invoice_id],
         )
 
-        discrepancies = state.get(
-            "discrepancies"
-        ) or []
-
-        insert_discrepancy_query = """
-            INSERT INTO audit.discrepancies (
-                invoice_id,
-                discrepancy_type,
-                severity,
-                message,
-                details,
-                status
-            )
-            VALUES (
-                %s, %s, %s,
-                %s, %s::jsonb, %s
-            )
-        """
-
-        discrepancy_parameters = []
-
+        unmatched_existing = list(existing_open)
         for discrepancy in discrepancies:
-            discrepancy_parameters.append(
-                [
-                    invoice_id,
-                    discrepancy.get(
-                        "type",
-                        "validation_error",
-                    ),
-                    discrepancy.get(
-                        "severity",
-                        "high",
-                    ),
-                    discrepancy.get(
-                        "message",
-                        str(discrepancy),
-                    ),
-                    _json(discrepancy),
-                    discrepancy.get(
-                        "status",
-                        "open",
-                    ),
-                ]
-            )
-
-        if discrepancy_parameters:
-            db.execute_many(
-                insert_discrepancy_query,
-                discrepancy_parameters,
-            )
+            dtype = str(discrepancy.get("type") or "validation_error")
+            message = str(discrepancy.get("message") or discrepancy)
+            match = next((row for row in unmatched_existing
+                          if str(row.get("discrepancy_type")) == dtype
+                          and str(row.get("message")) == message), None)
+            severity = str(discrepancy.get("severity") or "high")
+            details = _json(discrepancy)
+            status = str(discrepancy.get("status") or "open").lower()
+            if match:
+                unmatched_existing.remove(match)
+                db.execute(
+                    "UPDATE audit.discrepancies SET severity = %s, details = %s::jsonb, status = %s WHERE id = %s",
+                    [severity, details, status, match["id"]],
+                )
+            else:
+                db.execute(
+                    """INSERT INTO audit.discrepancies
+                       (invoice_id, discrepancy_type, severity, message, details, status)
+                       VALUES (%s, %s, %s, %s, %s::jsonb, %s)""",
+                    [invoice_id, dtype, severity, message, details, status],
+                )
 
         # --------------------------------------------------------
         # Human feedback
@@ -660,4 +640,35 @@ def persist_invoice(
             "errors": [
                 f"Invoice persistence failed: {exc}"
             ],
+        }
+
+class _PersistenceRollback(Exception):
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        super().__init__(str(result.get("persistence_error") or "Persistence failed"))
+
+
+def persist_invoice(state: dict[str, Any]) -> dict[str, Any]:
+    """Persist the full invoice snapshot atomically.
+
+    All existing db.execute calls inside the implementation share this outer
+    transaction. A failed operation forces rollback rather than committing a
+    partially-updated invoice, line-item set, discrepancy set or audit history.
+    """
+    try:
+        with db.transaction():
+            result = _persist_invoice_impl(state)
+            if result.get("persistence_status") != "persisted":
+                raise _PersistenceRollback(result)
+            return result
+    except _PersistenceRollback as exc:
+        return exc.result
+    except Exception as exc:
+        invoice_id = str(state.get("invoice_id") or "")
+        return {
+            "invoice_id": invoice_id,
+            "persistence_status": "failed",
+            "persistence_error": str(exc),
+            "processing_status": "failed",
+            "errors": [f"Invoice persistence transaction rolled back: {exc}"],
         }

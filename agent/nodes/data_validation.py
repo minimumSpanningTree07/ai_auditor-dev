@@ -628,6 +628,9 @@ def data_validate(state: dict[str, Any]) -> dict[str, Any]:
         "data_validation_passed": data_validation_passed,
         "data_validation_errors": errors,
         "data_validation_warnings": warnings,
+        # Keep the current run's findings separate from the previous run so
+        # business validation can rebuild the active discrepancy set cleanly.
+        "data_validation_discrepancies": discrepancies,
         "validation_errors": errors,
         "validation_warnings": warnings,
         "missing_fields": missing_fields,

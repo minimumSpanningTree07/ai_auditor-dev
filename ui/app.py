@@ -482,6 +482,34 @@ def render_hitl(invoice: dict[str, Any], invoice_id: str) -> None:
             st.warning(f"Could not load ERP comparison: {exc}")
             st.caption("You can still review the extracted invoice values, but verify the purchase order in ERP before approving.")
 
+    # Editable invoice header fields are submitted separately from line items.
+    # This allows a reviewer to correct missing/wrong PO, currency or totals.
+    scalar_corrections: dict[str, Any] = {}
+    st.markdown("### Correct invoice header fields")
+    st.caption("These edits change the audited invoice record, not the ERP master data.")
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        edited_invoice_number = st.text_input("Invoice number", value=str(invoice.get("invoice_number") or ""), key=f"review_invoice_number_{invoice_id}")
+        edited_po_number = st.text_input("Purchase order", value=str(invoice.get("po_number") or ""), key=f"review_po_number_{invoice_id}")
+    with h2:
+        edited_currency = st.text_input("Currency (ISO code)", value=str(invoice.get("currency") or ""), key=f"review_currency_{invoice_id}")
+        edited_invoice_date = st.text_input("Invoice date (YYYY-MM-DD)", value=str(invoice.get("invoice_date") or "")[:10], key=f"review_invoice_date_{invoice_id}")
+    with h3:
+        edited_subtotal = st.text_input("Subtotal", value=str(invoice.get("subtotal_amount") or ""), key=f"review_subtotal_{invoice_id}")
+        edited_tax = st.text_input("Tax amount", value=str(invoice.get("tax_amount") or ""), key=f"review_tax_{invoice_id}")
+        edited_total = st.text_input("Invoice total", value=str(invoice.get("total_amount") or ""), key=f"review_total_{invoice_id}")
+    for field, edited, original in [
+        ("invoice_number", edited_invoice_number, invoice.get("invoice_number")),
+        ("po_number", edited_po_number, invoice.get("po_number")),
+        ("currency", edited_currency, invoice.get("currency")),
+        ("invoice_date", edited_invoice_date, invoice.get("invoice_date")),
+        ("subtotal_amount", edited_subtotal, invoice.get("subtotal_amount")),
+        ("tax_amount", edited_tax, invoice.get("tax_amount")),
+        ("total_amount", edited_total, invoice.get("total_amount")),
+    ]:
+        if edited.strip() != str(original or ""):
+            scalar_corrections[field] = edited.strip() or None
+
     corrections: list[dict[str, Any]] = []
     if line_items:
         st.markdown("### Correct extracted invoice values")
@@ -553,8 +581,9 @@ def render_hitl(invoice: dict[str, Any], invoice_id: str) -> None:
         "Reject": "Record that this invoice should not be approved.",
     }
     st.caption(action_help[decision])
-    if corrections and decision != "Correct & revalidate":
-        st.warning(f"You changed {len(corrections)} line item(s). Choose ‘Correct & revalidate’ to submit those edits.")
+    correction_count = len(corrections) + len(scalar_corrections)
+    if correction_count and decision != "Correct & revalidate":
+        st.warning(f"You changed {correction_count} value(s). Choose ‘Correct & revalidate’ to submit those edits.")
     submit_disabled = invoice.get("source_available") is False and decision in {"Revalidate without changes", "Correct & revalidate"}
     action_button_label = {
         "Revalidate without changes": "Run revalidation",
@@ -563,14 +592,18 @@ def render_hitl(invoice: dict[str, Any], invoice_id: str) -> None:
         "Reject": "Save rejection",
     }[decision]
     if st.button(action_button_label, type="primary", disabled=submit_disabled, key=f"submit_review_{invoice_id}", use_container_width=True):
-        if decision == "Correct & revalidate" and not corrections and not feedback.strip():
+        if decision == "Correct & revalidate" and not corrections and not scalar_corrections and not feedback.strip():
             st.warning("Make a correction or add auditor notes before submitting this action.")
             return
         api_decision = {
             "Revalidate without changes": "revalidate", "Correct & revalidate": "corrected",
             "Approve": "approved", "Reject": "rejected",
         }[decision]
-        payload = {"line_items": corrections} if corrections and decision == "Correct & revalidate" else {}
+        payload: dict[str, Any] = {}
+        if decision == "Correct & revalidate":
+            payload.update(scalar_corrections)
+            if corrections:
+                payload["line_items"] = corrections
         try:
             with st.spinner(f"Saving review for {file_name} and updating the audit record…"):
                 result = revalidate_invoice(invoice_id, corrections=payload, decision=api_decision, feedback=feedback.strip() or None)

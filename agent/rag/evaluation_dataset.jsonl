@@ -1,0 +1,5 @@
+{"question":"What is the invoice number and total amount?","reference":"State the invoice number and total amount exactly as shown in the retrieved invoice or saved audit record."}
+{"question":"Which purchase order is associated with this invoice?","reference":"State the purchase order number if it is present in the retrieved evidence; otherwise clearly say that the evidence does not specify one."}
+{"question":"What discrepancies were recorded for this invoice?","reference":"Summarize only the discrepancies explicitly supported by the retrieved invoice or audit evidence. If none are present in the evidence, say so."}
+{"question":"Does the invoice pass validation, and what is the recommendation?","reference":"Report the validation status and recommendation based only on the retrieved evidence; do not infer a status if it is absent."}
+{"question":"Which line items have a quantity or unit-price mismatch?","reference":"Identify only line items and quantity/unit-price mismatches explicitly supported by the retrieved evidence; otherwise state that the evidence is insufficient."}

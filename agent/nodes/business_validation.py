@@ -681,8 +681,13 @@ def business_validate(state: dict[str, Any]) -> dict[str, Any]:
     existing_discrepancies = list(state.get("discrepancies") or [])
 
     if state.get("workflow_mode") == "human_revalidation":
-        # Human corrections must be validated from scratch.
-        merged_discrepancies = list(discrepancies)
+        # Revalidation starts a new validation pass. Preserve current data
+        # validation findings and add current ERP findings, but never carry
+        # forward open findings from the previous pass.
+        current_data_findings = list(
+            state.get("data_validation_discrepancies") or []
+        )
+        merged_discrepancies = current_data_findings + list(discrepancies)
     else:
         generated_keys = {
             (item.get("type"), item.get("message"))
