@@ -137,8 +137,9 @@ def _determine_outcome(
     if decision in {"reject", "rejected"}:
         return "rejected", "reject", False
 
-    # Explicit human decision takes precedence over the automated
-    # recommendation. The report still retains any unresolved findings.
+    # Explicit auditor approval is a deliberate override and remains auditable.
+    # Normal correction flow uses revalidation and therefore reaches this branch
+    # only after the current checks have been recomputed.
     if decision in {"approve", "approved"}:
         return "approved", "approve", False
 
@@ -149,15 +150,19 @@ def _determine_outcome(
     missing_erp_records = state.get("missing_erp_records") or []
     missing_fields = state.get("missing_fields") or []
 
+    if lookup_failed or missing_erp_records:
+        return "invalid_erp", "reject", False
+
     if (
         not data_passed
         or not business_passed
-        or lookup_failed
-        or missing_erp_records
         or missing_fields
         or open_discrepancies
     ):
         return "manual_review", "manual_review", True
+
+    if decision in {"approve", "approved"}:
+        return "approved", "approve", False
 
     return "approved", "approve", False
 

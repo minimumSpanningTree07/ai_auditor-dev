@@ -15,8 +15,8 @@ from agent.nodes.monitor import monitor_invoice
 from agent.nodes.extraction import extract_invoice
 from agent.nodes.translation import translate_invoice
 from agent.nodes.field_extraction import extract_fields
-from agent.nodes.business_validation import validate_business
-from agent.nodes.data_validation import validate_data
+from agent.nodes.business_validation import business_validate as validate_business
+from agent.nodes.data_validation import data_validate as validate_data
 from agent.nodes.reporting import generate_report
 from agent.nodes.persistence import persist_invoice
 

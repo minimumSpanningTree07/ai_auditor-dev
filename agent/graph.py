@@ -19,6 +19,7 @@ from agent.nodes.persistence import persist_invoice
 from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg
 from agent.config import settings
+from agent.services.database import update_processing_stage
 
 
 # ---------------------------------------------------------------------
@@ -97,7 +98,10 @@ def route_after_data_validation(state: InvoiceState) -> str:
 def route_after_business_validation(state: InvoiceState) -> str:
     if state.get("processing_status") == "failed":
         return "end"
-
+    # Missing ERP master data is a hard business stop: report the invalid
+    # state, persist it, and do not continue to human correction/RAG.
+    if state.get("missing_erp_records") or state.get("erp_lookup_failed"):
+        return "reporting"
     return "reporting"
 
 # def route_after_business_validation(state: InvoiceState) -> str:
@@ -140,13 +144,13 @@ def route_after_reporting(state: InvoiceState) -> str:
     return "persistence"
 
 def route_after_persistence(state: InvoiceState) -> str:
-    """Index every persisted invoice, including invoices requiring human review.
-
-    Human review is performed through the explicit revalidation API/UI. Pausing
-    the initial graph before indexing made manual-review invoices invisible to Ask AI.
-    """
+    """Persist first, then pause for HITL, otherwise index the current truth."""
     if state.get("persistence_status") != "persisted":
         return "end"
+    if state.get("missing_erp_records") or state.get("erp_lookup_failed"):
+        return "end"
+    if state.get("human_review_required") and not state.get("human_decision"):
+        return "human_review"
     return "rag_indexing"
 
 # def route_after_persistence(state: InvoiceState) -> str:
@@ -321,22 +325,63 @@ def rag_indexing_node(state: InvoiceState) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
+# Live stage tracking
+# ---------------------------------------------------------------------
+
+_STAGE_META = {
+    "monitor": ("monitoring", "Monitoring / queued", 10),
+    "extract": ("extraction", "Extraction / OCR", 25),
+    "translate": ("translation", "Translation", 40),
+    "field_extraction": ("field_extraction", "Field extraction", 50),
+    "data_validation": ("validation", "Invoice validation", 65),
+    "business_validation": ("business_validation", "ERP business validation", 78),
+    "reporting": ("reporting", "Report generation", 88),
+    "persistence": ("persistence", "Saving audit record", 94),
+    "human_review": ("human_review", "Human review required", 96),
+    "rag_indexing": ("rag", "RAG indexing", 100),
+}
+
+def _tracked(name: str, fn):
+    stage, label, progress = _STAGE_META[name]
+    def wrapped(state):
+        update_processing_stage(state.get("invoice_id"), state.get("file_name"), state.get("file_checksum"),
+                               stage, label, progress, "processing", f"Running {label.lower()}.")
+        result = fn(state)
+        if isinstance(result, dict):
+            status = str(result.get("processing_status") or "processing")
+            error = None if status not in {"failed", "human_review_invalid_response"} else "; ".join(map(str, result.get("errors") or []))
+            result_status = str(result.get("processing_status") or "")
+            if stage == "human_review" and not result.get("human_review_action"):
+                live_status = "waiting"
+            elif error:
+                live_status = "failed"
+            elif result_status in {"complete", "persistence_complete", "duplicate"} or result.get("rag_indexed"):
+                live_status = "complete"
+            else:
+                live_status = "processing"
+            update_processing_stage(state.get("invoice_id") or result.get("invoice_id"), state.get("file_name"), state.get("file_checksum"),
+                                   stage, label, progress, live_status,
+                                   str(result.get("message") or f"{label} completed."), error)
+        return result
+    return wrapped
+
+# ---------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------
 
 def build_invoice_graph():
     builder = StateGraph(InvoiceState)
 
-    builder.add_node("monitor", monitor_invoice)
-    builder.add_node("extract", extract_invoice)
-    builder.add_node("translate", translate_invoice)
-    builder.add_node("field_extraction", extract_fields)
-    builder.add_node("data_validation", data_validate)
-    builder.add_node("business_validation", business_validate)
-    builder.add_node("human_review", human_review_pause)
-    builder.add_node("reporting", generate_report)
-    builder.add_node("persistence", persist_invoice)
-    builder.add_node("rag_indexing", rag_indexing_node)
+    builder.add_node("monitor", _tracked("monitor", monitor_invoice))
+    builder.add_node("extract", _tracked("extract", extract_invoice))
+    builder.add_node("translate", _tracked("translate", translate_invoice))
+    builder.add_node("field_extraction", _tracked("field_extraction", extract_fields))
+    builder.add_node("data_validation", _tracked("data_validation", data_validate))
+    builder.add_node("business_validation", _tracked("business_validation", business_validate))
+    builder.add_node("human_review", _tracked("human_review", human_review_pause))
+    builder.add_node("reporting", _tracked("reporting", generate_report))
+    builder.add_node("persistence", _tracked("persistence", persist_invoice))
+    builder.add_node("rag_indexing", _tracked("rag_indexing", rag_indexing_node))
 
     builder.add_edge(START, "monitor")
 

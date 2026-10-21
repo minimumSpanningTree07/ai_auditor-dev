@@ -56,6 +56,21 @@ def _ensure_invoice_id(
     return str(uuid.uuid4())
 
 
+def _save_html_report(invoice_id: str, report: dict[str, Any] | None) -> str | None:
+    if not report:
+        return None
+    reports_dir = Path(settings.reports_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    esc = lambda v: str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    discrepancies = report.get("unresolved_discrepancies") or []
+    rows = "".join(f"<tr><td>{esc(d.get('type'))}</td><td>{esc(d.get('severity'))}</td><td>{esc(d.get('message'))}</td><td>{esc(d.get('status'))}</td></tr>" for d in discrepancies) or "<tr><td colspan='4'>No unresolved discrepancies.</td></tr>"
+    inv = report.get("invoice") or {}
+    html = f"""<!doctype html><html><head><meta charset='utf-8'><title>Invoice Audit {esc(inv.get('invoice_number'))}</title><style>body{{font-family:Inter,Arial,sans-serif;background:#f6f8fa;color:#17212b;padding:32px}}main{{max-width:1100px;margin:auto;background:#fff;padding:32px;border-radius:18px}}h1{{margin-bottom:4px}}.meta{{color:#66727d;margin-bottom:24px}}table{{width:100%;border-collapse:collapse;margin-top:12px}}th,td{{padding:10px;border-bottom:1px solid #e3e8ed;text-align:left}}th{{background:#f6f8fa}}.badge{{display:inline-block;padding:6px 10px;border-radius:999px;background:#eaf5f2;color:#0f5f59;font-weight:700}}</style></head><body><main><h1>Invoice Audit Report</h1><div class='meta'>{esc(inv.get('invoice_number') or 'Unknown')} · {esc(inv.get('vendor_name') or 'Unknown vendor')}</div><p><span class='badge'>{esc(report.get('validation_status'))}</span> &nbsp; Recommendation: <b>{esc(report.get('recommendation'))}</b> &nbsp; Audit score: <b>{esc(report.get('audit_score'))}/100</b></p><h2>Invoice</h2><table><tr><th>Field</th><th>Value</th></tr>{''.join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k,v in inv.items() if k != 'line_items')}</table><h2>Unresolved discrepancies</h2><table><tr><th>Type</th><th>Severity</th><th>Message</th><th>Status</th></tr>{rows}</table><h2>Validation</h2><pre>{esc(report.get('validation'))}</pre><h2>Human review</h2><pre>{esc(report.get('human_review'))}</pre></main></body></html>"""
+    path=reports_dir / f"{invoice_id}.html"
+    path.write_text(html,encoding="utf-8")
+    return str(path)
+
+
 def _save_report(
     invoice_id: str,
     report: dict[str, Any] | None,
@@ -224,10 +239,8 @@ def _persist_invoice_impl(
     report = state.get("report")
 
     try:
-        report_path = _save_report(
-            invoice_id,
-            report,
-        )
+        report_path = _save_report(invoice_id, report)
+        html_report_path = _save_html_report(invoice_id, report)
 
         # --------------------------------------------------------
         # Effective scalar values
@@ -607,6 +620,7 @@ def _persist_invoice_impl(
                                 "human_review_required"
                             ),
                         "report_path": report_path,
+                        "html_report_path": html_report_path,
                     }
                 ),
             ],

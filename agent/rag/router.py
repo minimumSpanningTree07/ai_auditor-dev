@@ -9,7 +9,8 @@ from agent.config import settings
 # Only these read-only query categories are routed to SQL.
 # Everything else goes through RAG.
 _STRUCTURED_PATTERNS = [
-    r"\b(invoice\s+number|invoice\s+no)\b",
+    r"\b(invoice\s+number|invoice\s+no|invoice\s+id)\b",
+    r"\b(how\s+many|count|list|show|find)\b.*\b(invoice|invoices)\b",
     r"\b(vendor|supplier)\b.*\b(invoice|invoices)\b",
     r"\b(invoice|invoices)\b.*\b(status|state)\b",
     r"\b(invoice|invoices)\b.*\b(total|amount|value)\b",
@@ -17,6 +18,9 @@ _STRUCTURED_PATTERNS = [
     r"\b(invoice|invoices)\b.*\b(recommendation|decision)\b",
     r"\b(invoice|invoices)\b.*\b(po|purchase\s+order)\b",
     r"\b(invoice|invoices)\b.*\b(currency)\b",
+    r"\b(invoice|invoices)\b.*\b(date|po|purchase\s+order|vendor|supplier)\b",
+    r"^\s*what\s+(?:is|are|was|were)\b.*\b(total|amount|status|state|vendor|supplier|currency|purchase\s+order|po|invoice\s+number|line\s+items|sku|discrepanc(?:y|ies))\b",
+    r"^\s*(?:how\s+many|count|list|show)\b.*\b(invoice|invoices|discrepanc(?:y|ies)|line\s+items)\b",
 ]
 
 

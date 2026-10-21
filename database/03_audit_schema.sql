@@ -200,3 +200,36 @@ CREATE TRIGGER trg_audit_discrepancies_updated_at
 BEFORE UPDATE ON audit.discrepancies
 FOR EACH ROW
 EXECUTE FUNCTION audit.update_updated_at();
+CREATE TABLE IF NOT EXISTS audit.processing_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    invoice_id VARCHAR(128),
+    file_name TEXT NOT NULL,
+    file_checksum VARCHAR(128),
+    stage VARCHAR(64) NOT NULL DEFAULT 'uploaded',
+    stage_label TEXT NOT NULL DEFAULT 'Uploaded',
+    status VARCHAR(32) NOT NULL DEFAULT 'queued',
+    message TEXT,
+    progress_percent INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_checksum ON audit.processing_jobs(file_checksum);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_invoice ON audit.processing_jobs(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_updated ON audit.processing_jobs(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS audit.rag_evaluations (
+    id BIGSERIAL PRIMARY KEY,
+    invoice_id VARCHAR(128),
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    route VARCHAR(32) NOT NULL DEFAULT 'rag',
+    metrics JSONB NOT NULL DEFAULT '{}'::JSONB,
+    overall_score NUMERIC(8,4),
+    accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_evaluations_invoice ON audit.rag_evaluations(invoice_id);
+CREATE INDEX IF NOT EXISTS idx_rag_evaluations_created ON audit.rag_evaluations(created_at DESC);

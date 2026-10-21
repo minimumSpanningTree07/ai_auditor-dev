@@ -575,3 +575,33 @@ class Database:
 # ================================================================
 
 db = Database()
+
+def update_processing_stage(invoice_id: str | None, file_name: str | None, file_checksum: str | None,
+                             stage: str, stage_label: str, progress: int, status: str = "processing",
+                             message: str | None = None, error: str | None = None) -> None:
+    """Best-effort live workflow status. This is operational state, not audit truth."""
+    if not file_name and not invoice_id:
+        return
+    try:
+        existing = db.fetch_one(
+            """SELECT id FROM audit.processing_jobs
+               WHERE (%s IS NOT NULL AND invoice_id = %s)
+                  OR (%s IS NOT NULL AND file_checksum = %s)
+               ORDER BY updated_at DESC LIMIT 1""",
+            [invoice_id, invoice_id, file_checksum, file_checksum],
+        )
+        values = [invoice_id, file_name or "unknown", file_checksum, stage, stage_label, status, message, progress, error]
+        if existing:
+            db.execute(
+                """UPDATE audit.processing_jobs SET invoice_id=%s, file_name=%s, file_checksum=%s,
+                   stage=%s, stage_label=%s, status=%s, message=%s, progress_percent=%s, error=%s, updated_at=NOW()
+                   WHERE id=%s""", values + [existing["id"]],
+            )
+        else:
+            db.execute(
+                """INSERT INTO audit.processing_jobs
+                   (invoice_id, file_name, file_checksum, stage, stage_label, status, message, progress_percent, error)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""", values,
+            )
+    except Exception:
+        return

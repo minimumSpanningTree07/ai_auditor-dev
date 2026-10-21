@@ -131,7 +131,7 @@ def invoice_discrepancies(
             details,
             status
         FROM audit.discrepancies
-        WHERE invoice_id = %s
+        WHERE invoice_id = %s AND UPPER(status) = 'OPEN'
         ORDER BY id
         """,
         (invoice_id,),

@@ -8,145 +8,121 @@ from agent.rag.retrieval import retrieve
 from agent.rag.augmentation import augment
 from agent.rag.generation import generate
 from agent.rag.reflection import reflect
+from agent.rag.ragas_metrics import evaluate_answer
 
 
-def _structured_invoice_context(invoice_id: str | None) -> str:
-    """Add authoritative saved audit facts to semantic context for a selected invoice."""
-    if not invoice_id:
+def _authoritative_context(invoice_id: str | None) -> str:
+    """Build current truth from PostgreSQL. Qdrant is supporting evidence only."""
+    if invoice_id:
+        invoice = db.fetch_one(
+            """SELECT invoice_id, file_name, invoice_number, vendor_name, po_number,
+                      invoice_date, currency, subtotal_amount, tax_amount, tax_rate,
+                      total_amount, validation_status, recommendation,
+                      human_review_required, updated_at
+               FROM audit.invoices WHERE invoice_id = %s""",
+            [invoice_id],
+        )
+        if not invoice:
+            return ""
+        rows = db.fetch_all(
+            """SELECT line_number, sku, description, quantity, unit_price, line_total, source
+               FROM audit.invoice_line_items WHERE invoice_id = %s ORDER BY line_number""",
+            [invoice_id],
+        )
+        discrepancies = db.fetch_all(
+            """SELECT discrepancy_type, severity, message, details, status
+               FROM audit.discrepancies WHERE invoice_id = %s AND UPPER(status) = 'OPEN' ORDER BY id""",
+            [invoice_id],
+        )
+        feedback = db.fetch_all(
+            """SELECT decision, feedback, corrections, created_at
+               FROM audit.human_feedback WHERE invoice_id = %s ORDER BY created_at DESC""",
+            [invoice_id],
+        )
+        parts = ["=== AUTHORITATIVE CURRENT AUDIT TABLE ==="]
+        for key, value in invoice.items():
+            if key != "invoice_id":
+                parts.append(f"{key}: {value}")
+        parts.append("line_items:")
+        for row in rows:
+            parts.append(f"- {row}")
+        parts.append("CURRENT OPEN DISCREPANCIES:")
+        for row in discrepancies:
+            parts.append(f"- {row}")
+        if not discrepancies:
+            parts.append("- none")
+        parts.append(f"open_discrepancy_count: {len(discrepancies)}")
+        parts.append("human_feedback_history:")
+        for row in feedback:
+            parts.append(f"- {row}")
+        return "\n".join(parts)
+
+    invoices = db.fetch_all(
+        """SELECT invoice_id, file_name, invoice_number, vendor_name, po_number,
+                  invoice_date, currency, total_amount, validation_status,
+                  recommendation, human_review_required, updated_at
+           FROM audit.invoices ORDER BY updated_at DESC LIMIT 100"""
+    )
+    if not invoices:
         return ""
-    invoice = db.fetch_one(
-        """SELECT file_name, invoice_number, vendor_name, po_number, invoice_date,
-                  currency, subtotal_amount, tax_amount, tax_rate, total_amount,
-                  validation_status, recommendation, human_review_required
-           FROM audit.invoices WHERE invoice_id = %s""",
-        [invoice_id],
-    )
-    if not invoice:
-        return ""
-    discrepancies = db.fetch_all(
-        """SELECT discrepancy_type, severity, message, details, status
-           FROM audit.discrepancies WHERE invoice_id = %s ORDER BY id""",
-        [invoice_id],
-    )
-    lines = db.fetch_all(
-        """SELECT line_number, sku, description, quantity, unit_price, line_total, source
-           FROM audit.invoice_line_items WHERE invoice_id = %s ORDER BY line_number""",
-        [invoice_id],
-    )
-    fields = [
-        "AUTHORITATIVE SAVED AUDIT RECORD (use for current status and structured values)",
-        f"File: {invoice.get('file_name') or 'unknown'}",
-        f"Invoice number: {invoice.get('invoice_number') or 'not extracted'}",
-        f"Vendor: {invoice.get('vendor_name') or 'not identified'}",
-        f"Purchase order: {invoice.get('po_number') or 'not identified'}",
-        f"Invoice date: {invoice.get('invoice_date') or 'not recorded'}",
-        f"Currency: {invoice.get('currency') or 'not validated'}",
-        f"Subtotal: {invoice.get('subtotal_amount') if invoice.get('subtotal_amount') is not None else 'not recorded'}",
-        f"Tax: {invoice.get('tax_amount') if invoice.get('tax_amount') is not None else 'not recorded'}",
-        f"Tax rate: {invoice.get('tax_rate') if invoice.get('tax_rate') is not None else 'not recorded'}",
-        f"Total: {invoice.get('total_amount') if invoice.get('total_amount') is not None else 'not recorded'}",
-        f"Validation status: {invoice.get('validation_status') or 'unknown'}",
-        f"Recommendation: {invoice.get('recommendation') or 'not recorded'}",
-        f"Human review required: {bool(invoice.get('human_review_required'))}",
-        "Line items:",
-    ]
-    if lines:
-        for line in lines:
-            fields.append(
-                f"- Line {line.get('line_number')}: SKU {line.get('sku') or 'unknown'}; "
-                f"description {line.get('description') or 'not recorded'}; "
-                f"quantity {line.get('quantity')}; unit price {line.get('unit_price')}; "
-                f"line total {line.get('line_total')}"
-            )
-    else:
-        fields.append("- No line items are stored.")
-    fields.append("Recorded discrepancies:")
-    if discrepancies:
-        for item in discrepancies:
-            fields.append(
-                f"- [{item.get('severity') or 'unspecified'}] "
-                f"{item.get('discrepancy_type') or 'validation issue'}: "
-                f"{item.get('message') or item.get('details') or 'No explanation recorded.'}; "
-                f"status={item.get('status') or 'unknown'}"
-            )
-    else:
-        fields.append("- No discrepancies are recorded.")
-    return "\n".join(fields)
+    return "=== AUTHORITATIVE CURRENT AUDIT TABLE (ALL INVOICES) ===\n" + "\n".join(str(r) for r in invoices)
 
 
 def run_rag(question: str, invoice_id: str | None = None) -> dict[str, Any]:
     max_retries = int(settings.rag_max_retries)
-    structured_context = _structured_invoice_context(invoice_id)
-    last_result: dict[str, Any] = {
+    authoritative = _authoritative_context(invoice_id)
+    last: dict[str, Any] = {
         "question": question, "invoice_id": invoice_id, "documents": [],
-        "context": structured_context, "answer": "", "reflection": {},
+        "context": authoritative, "answer": "", "reflection": {},
         "accepted": False, "retry_count": 0,
-        "structured_context_used": bool(structured_context),
+        "structured_context_used": bool(authoritative),
+        "ragas": {},
     }
 
     for attempt in range(max_retries + 1):
-        documents = retrieve(question=question, invoice_id=invoice_id)
+        try:
+            documents = retrieve(question=question, invoice_id=invoice_id)
+        except Exception:
+            documents = []
         augmented = augment(documents)
         semantic_context = str(augmented.get("context") or "").strip()
-        context_parts = [part for part in (semantic_context, structured_context) if part]
-        context = "\n\n--- VERIFIED AUDIT DATA ---\n\n".join(context_parts)
-
-        # A selected invoice's saved audit record is valid evidence even when
-        # semantic retrieval scores are weak or the Qdrant index is empty.
-        if not context.strip():
-            last_result = {
-                **last_result, "documents": documents, "context": "", "answer": "",
-                "reflection": {"overall_score": 0.0, "accepted": False,
-                               "reason": "No relevant invoice evidence was retrieved and no saved audit facts were available."},
-                "accepted": False, "retry_count": attempt,
-            }
+        context = "\n\n".join(p for p in (authoritative, semantic_context) if p)
+        if not context:
+            last["retry_count"] = attempt
             if attempt < max_retries:
                 continue
             break
-
         try:
             answer = str(generate(question=question, context=context) or "").strip()
         except Exception as exc:
-            last_result = {
-                **last_result, "documents": documents, "context": context,
-                "answer": "", "reflection": {"overall_score": 0.0, "accepted": False,
-                "reason": f"Answer generation failed: {exc}"},
-                "accepted": False, "retry_count": attempt,
-                "structured_context_used": bool(structured_context),
-            }
-            # A provider/API exception will not be fixed by repeating the same
-            # request with the same model and context. Return to the API layer,
-            # which can use the deterministic saved-audit answer instead.
+            last.update({"documents": documents, "context": context, "retry_count": attempt,
+                         "reflection": {"overall_score": 0.0, "accepted": False, "reason": str(exc)}})
             break
         if not answer:
-            last_result = {
-                **last_result, "documents": documents, "context": context,
-                "answer": "", "reflection": {"overall_score": 0.0, "accepted": False,
-                "reason": "The answer model returned an empty response."},
-                "accepted": False, "retry_count": attempt,
-                "structured_context_used": bool(structured_context),
-            }
             break
-
         try:
             reflection = reflect(question=question, context=context, answer=answer)
         except Exception as exc:
-            reflection = {
-                "context_relevance": 0.0, "groundedness": 0.0,
-                "question_relevance": 0.0, "overall_score": 0.0,
-                "reason": f"Answer generated, but the quality evaluator failed: {exc}",
-                "accepted": False, "reflection_failed": True,
-            }
-        accepted = bool(reflection.get("accepted", False))
-        last_result = {
-            "question": question, "invoice_id": invoice_id,
-            "documents": documents, "context": context, "answer": answer,
-            "reflection": reflection, "accepted": accepted,
-            "retry_count": attempt,
-            "structured_context_used": bool(structured_context),
-        }
-        if accepted or reflection.get("reflection_failed"):
-            # Don't spend repeated model calls trying to recover from an
-            # evaluator outage; preserve the generated answer and its status.
+            reflection = {"context_relevance": 0.0, "groundedness": 0.0,
+                          "question_relevance": 0.0, "overall_score": 0.0,
+                          "accepted": False, "reflection_failed": True,
+                          "reason": f"Reflection failed: {exc}"}
+        try:
+            ragas = evaluate_answer(question=question, answer=answer,
+                                    contexts=[authoritative] + ([semantic_context] if semantic_context else []),
+                                    reference=None)
+        except Exception as exc:
+            ragas = {"available": False, "error": str(exc),
+                     "faithfulness": reflection.get("groundedness", 0.0),
+                     "answer_relevancy": reflection.get("question_relevance", 0.0),
+                     "context_relevance": reflection.get("context_relevance", 0.0),
+                     "factual_accuracy": reflection.get("groundedness", 0.0),
+                     "overall": reflection.get("overall_score", 0.0),
+                     "source": "reflection_fallback"}
+        last = {"question": question, "invoice_id": invoice_id, "documents": documents,
+                "context": context, "answer": answer, "reflection": reflection,
+                "accepted": bool(reflection.get("accepted")), "retry_count": attempt,
+                "structured_context_used": bool(authoritative), "ragas": ragas}
+        if last["accepted"] or reflection.get("reflection_failed"):
             break
-    return last_result
+    return last

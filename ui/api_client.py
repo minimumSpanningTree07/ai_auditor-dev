@@ -187,3 +187,11 @@ def save_human_feedback(invoice_id: str, feedback: str) -> dict[str, Any]:
         f"/api/invoices/{invoice_id}/feedback",
         json={"feedback": feedback},
     )
+
+
+def get_comparison(invoice_id: str) -> dict[str, Any]:
+    return _request("GET", f"/api/invoices/{invoice_id}/comparison")
+
+
+def get_rag_evaluations(invoice_id: str) -> list[dict[str, Any]]:
+    return _request("GET", f"/api/invoices/{invoice_id}/rag-evaluations")

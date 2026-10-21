@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from agent.watcher import InvoiceWatcher
 from agent.config import settings
-from agent.graph import process_invoice
-from agent.services.database import db
+from agent.graph import process_invoice, resume_invoice, invoice_graph
+from agent.services.database import db, update_processing_stage
 from agent.services.erp_client import erp_client
 from agent.services.cache import cache
 from agent.services.checksum import calculate_sha256
@@ -86,14 +87,36 @@ class QueryResponse(BaseModel):
     fallback: bool = False
     answer_source: str = "rag"
     answer_needs_verification: bool = False
+    route: str = "rag"
+    ragas: dict[str, Any] = Field(default_factory=dict)
+    structured_data: dict[str, Any] = Field(default_factory=dict)
 # ------------------------------------------------------------------
 # Startup / shutdown
 # ------------------------------------------------------------------
+
+def ensure_runtime_schema() -> None:
+    """Create additive operational tables when an older PostgreSQL volume is reused."""
+    db.execute("""CREATE TABLE IF NOT EXISTS audit.processing_jobs (
+        id BIGSERIAL PRIMARY KEY, invoice_id VARCHAR(128), file_name TEXT NOT NULL,
+        file_checksum VARCHAR(128), stage VARCHAR(64) NOT NULL DEFAULT 'uploaded',
+        stage_label TEXT NOT NULL DEFAULT 'Uploaded', status VARCHAR(32) NOT NULL DEFAULT 'queued',
+        message TEXT, progress_percent INTEGER NOT NULL DEFAULT 0, error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_processing_jobs_invoice ON audit.processing_jobs(invoice_id)")
+    db.execute("""CREATE TABLE IF NOT EXISTS audit.rag_evaluations (
+        id BIGSERIAL PRIMARY KEY, invoice_id VARCHAR(128), question TEXT NOT NULL, answer TEXT NOT NULL,
+        route VARCHAR(32) NOT NULL DEFAULT 'rag', metrics JSONB NOT NULL DEFAULT '{}'::JSONB,
+        overall_score NUMERIC(8,4), accepted BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+
 
 @app.on_event("startup")
 async def startup_event():
     global watcher_task
 
+    try:
+        ensure_runtime_schema()
+    except Exception:
+        logger.exception("Could not initialize additive runtime audit tables")
     INCOMING_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -197,6 +220,8 @@ def reset_invoice_workspace(request: ResetWorkspaceRequest) -> dict[str, Any]:
     # the PostgreSQL volume are intentionally untouched.
     try:
         deleted_records = db.execute("DELETE FROM audit.invoices")
+        db.execute("DELETE FROM audit.processing_jobs")
+        db.execute("DELETE FROM audit.rag_evaluations")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not clear audit records: {exc}") from exc
 
@@ -233,82 +258,34 @@ def reset_invoice_workspace(request: ResetWorkspaceRequest) -> dict[str, Any]:
 
 @app.get("/api/uploads/status")
 def upload_status() -> dict[str, Any]:
-    """Return a combined view of files in the incoming folder and processed invoices."""
-    processed_rows = db.fetch_all(
-        """
-        SELECT invoice_id, file_name, file_path, file_checksum, invoice_number, vendor_name,
-               validation_status, recommendation, updated_at
-        FROM audit.invoices
-        ORDER BY updated_at DESC
-        """
+    """Live operational stage for every uploaded/processed file."""
+    rows = db.fetch_all(
+        """SELECT j.invoice_id, j.file_name, j.file_checksum, j.stage, j.stage_label,
+                  j.status, j.message, j.progress_percent, j.error, j.updated_at,
+                  i.invoice_number, i.vendor_name, i.validation_status, i.recommendation
+           FROM audit.processing_jobs j
+           LEFT JOIN audit.invoices i ON i.invoice_id = j.invoice_id
+           ORDER BY j.updated_at DESC"""
     )
-    processed_by_path = {}
-    processed_by_checksum = {}
-    for row in processed_rows:
-        file_path = row.get("file_path")
-        if file_path:
-            processed_by_path[str(Path(file_path).resolve())] = row
-        checksum = row.get("file_checksum")
-        if checksum:
-            processed_by_checksum[str(checksum).lower()] = row
-
-    files: list[dict[str, Any]] = []
-    present_paths: set[str] = set()
-    present_invoice_ids: set[str] = set()
-    for path in sorted(INCOMING_DIR.iterdir(), key=lambda item: item.name.lower()):
+    # Include source files that have not yet reached the watcher.
+    known = {str(r.get("file_checksum") or "").lower() for r in rows}
+    files = [dict(r) for r in rows]
+    for path in sorted(INCOMING_DIR.iterdir(), key=lambda p: p.name.lower()):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
-        resolved = str(path.resolve())
-        present_paths.add(resolved)
-        record = processed_by_path.get(resolved)
-        if record is None:
-            try:
-                record = processed_by_checksum.get(calculate_sha256(path).lower())
-            except OSError:
-                record = None
-        if record and record.get("invoice_id"):
-            present_invoice_ids.add(str(record["invoice_id"]))
-        key = resolved
-        if key in watcher.processing:
-            status = "processing"
-        elif record:
-            status = str(record.get("validation_status") or "processed")
-        elif key in watcher.retry_after:
-            status = "retry scheduled"
-        else:
-            status = "uploaded / queued"
-
-        stored_name = path.name
-        display_name = re.sub(r"^[0-9a-f]{32}__", "", stored_name, flags=re.IGNORECASE)
-        files.append({
-            "file_name": display_name,
-            "stored_filename": stored_name,
-            "status": status,
-            "invoice_id": record.get("invoice_id") if record else None,
-            "invoice_number": record.get("invoice_number") if record else None,
-            "vendor_name": record.get("vendor_name") if record else None,
-            "recommendation": record.get("recommendation") if record else None,
-            "updated_at": record.get("updated_at") if record else None,
-        })
-
-    # Keep processed records visible even if their source file has since been removed.
-    for row in processed_rows:
-        file_path = row.get("file_path")
-        if row.get("invoice_id") and str(row["invoice_id"]) in present_invoice_ids:
+        try:
+            checksum = calculate_sha256(path).lower()
+        except OSError:
+            checksum = ""
+        if checksum and checksum in known:
             continue
-        if file_path and str(Path(file_path).resolve()) in present_paths:
-            continue
-        files.append({
-            "file_name": row.get("file_name") or "Unknown file",
-            "stored_filename": None,
-            "status": str(row.get("validation_status") or "processed") + " (source file missing)",
-            "invoice_id": row.get("invoice_id"),
-            "invoice_number": row.get("invoice_number"),
-            "vendor_name": row.get("vendor_name"),
-            "recommendation": row.get("recommendation"),
-            "updated_at": row.get("updated_at"),
-        })
-
+        key = str(path.resolve())
+        status = "processing" if key in watcher.processing else "queued"
+        files.append({"invoice_id": None, "file_name": re.sub(r"^[0-9a-f]{32}__", "", path.name, flags=re.I),
+                      "file_checksum": checksum, "stage": "queued", "stage_label": "Uploaded / queued",
+                      "status": status, "message": "Waiting for watcher." if status == "queued" else "Currently processing.",
+                      "progress_percent": 5, "error": None, "invoice_number": None, "vendor_name": None,
+                      "validation_status": None, "recommendation": None, "updated_at": None})
     return {"files": files, "count": len(files), "incoming_directory": str(INCOMING_DIR)}
 
 
@@ -392,16 +369,44 @@ def get_invoice(
     )
 
     invoice["feedback"] = db.fetch_all(
-        """
-        SELECT *
-        FROM audit.human_feedback
-        WHERE invoice_id = %s
-        ORDER BY created_at DESC
-        """,
-        [invoice_id],
+        """SELECT * FROM audit.human_feedback WHERE invoice_id = %s ORDER BY created_at DESC""", [invoice_id],
+    )
+    invoice["original_extraction"] = db.fetch_one(
+        """SELECT extracted_invoice_number, extracted_vendor_name, extracted_po_number,
+                  extracted_invoice_date, extracted_currency, extracted_subtotal_amount,
+                  extracted_tax_amount, extracted_tax_rate, extracted_total_amount,
+                  extracted_line_items, extraction_method, extraction_confidence, created_at
+           FROM audit.invoice_extractions WHERE invoice_id = %s""", [invoice_id],
+    )
+    invoice["processing_stage"] = db.fetch_one(
+        """SELECT stage, stage_label, status, message, progress_percent, error, updated_at
+           FROM audit.processing_jobs WHERE invoice_id = %s ORDER BY updated_at DESC LIMIT 1""", [invoice_id],
     )
 
     return invoice
+
+
+@app.get("/api/invoices/{invoice_id}/comparison")
+def invoice_comparison(invoice_id: str) -> dict[str, Any]:
+    invoice = db.fetch_one("SELECT * FROM audit.invoices WHERE invoice_id = %s", [invoice_id])
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    original = db.fetch_one("SELECT * FROM audit.invoice_extractions WHERE invoice_id = %s", [invoice_id]) or {}
+    lines = db.fetch_all("SELECT line_number, sku, description, quantity, unit_price, line_total, source FROM audit.invoice_line_items WHERE invoice_id = %s ORDER BY line_number", [invoice_id])
+    erp = {}
+    po_number = invoice.get("po_number")
+    if po_number:
+        try:
+            erp["purchase_order"] = erp_client.get_purchase_order(str(po_number)) or {}
+        except Exception as exc:
+            erp["purchase_order_error"] = str(exc)
+    vendor_name = invoice.get("vendor_name")
+    if vendor_name:
+        try:
+            erp["vendor"] = erp_client.find_vendor(str(vendor_name)) or {}
+        except Exception as exc:
+            erp["vendor_error"] = str(exc)
+    return {"invoice": invoice, "original_extraction": original, "current_line_items": lines, "erp": erp}
 
 
 # ------------------------------------------------------------------
@@ -484,6 +489,7 @@ async def upload_invoice(
             )
 
         checksum = calculate_sha256(destination)
+        update_processing_stage(None, file.filename, checksum, "queued", "Uploaded / queued", 5, "queued", "File received and waiting for the invoice watcher.")
         existing = db.fetch_one(
             """SELECT invoice_id, file_name, invoice_number, vendor_name,
                       validation_status, recommendation
@@ -603,10 +609,8 @@ def revalidate_invoice(
     invoice = db.fetch_one(
         """
         SELECT
-            invoice_id,
-            file_path,
-            file_name,
-            file_checksum
+            invoice_id, file_path, file_name, file_checksum, raw_extracted_text,
+            translated_text, source_language, extraction_method, extraction_confidence
         FROM audit.invoices
         WHERE invoice_id = %s
         """,
@@ -656,22 +660,46 @@ def revalidate_invoice(
             detail="Unsupported decision. Use revalidate, corrected, approved, or rejected.",
         )
 
-    state = {
-        "invoice_id": invoice_id,
-        "file_path": str(file_path),
-        "file_name": invoice["file_name"],
-        "workflow_mode": "human_revalidation",
-        "thread_id": (
-            f"{invoice_id}:revalidation:"
-            f"{uuid.uuid4()}"
-        ),
-        "force_revalidation": True,
-        "human_decision": request.decision,
-        "human_feedback": request.feedback,
-        "human_corrections": request.corrections,
+    payload = {
+        "decision": request.decision,
+        "feedback": request.feedback,
+        "corrections": request.corrections or {},
     }
-
-    result = process_invoice(state)
+    # First try to resume the checkpoint created by the real HITL interrupt.
+    # This keeps the original extraction immutable and continues from the
+    # paused state rather than starting a second unrelated workflow.
+    config = {"configurable": {"thread_id": str(invoice_id)}}
+    snapshot = invoice_graph.get_state(config)
+    pending = bool(getattr(snapshot, "next", None) and "human_review" in tuple(snapshot.next))
+    if pending:
+        result = resume_invoice(invoice_id, payload)
+    else:
+        original = db.fetch_one("SELECT * FROM audit.invoice_extractions WHERE invoice_id = %s", [invoice_id]) or {}
+        state = {
+            "invoice_id": invoice_id, "file_path": str(file_path), "file_name": invoice["file_name"],
+            "workflow_mode": "human_revalidation", "thread_id": str(invoice_id),
+            "force_revalidation": True, "human_decision": request.decision,
+            "human_feedback": request.feedback, "human_corrections": request.corrections or {},
+            # Revalidation uses the immutable original extraction as its base;
+            # it must never call the LLM extractor a second time just because
+            # an auditor refreshed/restarted the UI.
+            "raw_extracted_text": invoice.get("raw_extracted_text"),
+            "translated_text": invoice.get("translated_text") or invoice.get("raw_extracted_text"),
+            "source_language": invoice.get("source_language") or "en",
+            "extraction_method": original.get("extraction_method") or invoice.get("extraction_method"),
+            "extraction_confidence": original.get("extraction_confidence") or invoice.get("extraction_confidence"),
+            "extracted_invoice_number": original.get("extracted_invoice_number"),
+            "extracted_vendor_name": original.get("extracted_vendor_name"),
+            "extracted_po_number": original.get("extracted_po_number"),
+            "extracted_invoice_date": original.get("extracted_invoice_date"),
+            "extracted_currency": original.get("extracted_currency"),
+            "extracted_subtotal_amount": original.get("extracted_subtotal_amount"),
+            "extracted_tax_amount": original.get("extracted_tax_amount"),
+            "extracted_tax_rate": original.get("extracted_tax_rate"),
+            "extracted_total_amount": original.get("extracted_total_amount"),
+            "extracted_line_items": original.get("extracted_line_items") or [],
+        }
+        result = process_invoice(state)
     if result.get("processing_status") == "failed" or result.get("persistence_status") == "failed":
         logger.error(
             "Invoice revalidation failed invoice_id=%s errors=%s",
@@ -775,6 +803,20 @@ def _saved_audit_answer(question: str, invoice_id: str) -> tuple[str, dict[str, 
     return "\n\n".join(parts), {"discrepancy_count": len(discrepancies), "line_item_count": len(lines), "source": "saved_audit_database"}
 
 
+@app.get("/api/processing/stages")
+def processing_stages() -> dict[str, Any]:
+    return upload_status()
+
+
+@app.get("/api/invoices/{invoice_id}/rag-evaluations")
+def rag_evaluations(invoice_id: str) -> list[dict[str, Any]]:
+    return db.fetch_all(
+        """SELECT id, question, answer, route, metrics, overall_score, accepted, created_at
+           FROM audit.rag_evaluations WHERE invoice_id = %s ORDER BY created_at DESC LIMIT 20""",
+        [invoice_id],
+    )
+
+
 # ------------------------------------------------------------------
 # Dashboard
 # ------------------------------------------------------------------
@@ -785,11 +827,26 @@ def query_invoice(request: QueryRequest) -> dict[str, Any]:
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    from agent.rag.router import route_question
+    route = route_question(question)
+
     if request.invoice_id and not db.fetch_one(
         "SELECT invoice_id FROM audit.invoices WHERE invoice_id = %s",
         [request.invoice_id],
     ):
         raise HTTPException(status_code=404, detail="Selected invoice not found.")
+
+    if route.get("rag_route") == "sql":
+        from agent.rag.sql_answers import answer_structured_question
+        structured = answer_structured_question(question, request.invoice_id)
+        answer = str(structured.get("answer") or "No structured result found.")
+        return {
+            "question": question, "invoice_id": request.invoice_id, "answer": answer,
+            "documents": [], "reflection": {"route": "sql"}, "accepted": True,
+            "retry_count": 0, "fallback": False, "answer_source": "sql",
+            "answer_needs_verification": False, "route": "sql",
+            "structured_data": structured.get("data", {}), "ragas": {},
+        }
 
     result: dict[str, Any] = {
         "answer": "", "documents": [], "reflection": {}, "accepted": False,
@@ -822,17 +879,21 @@ def query_invoice(request: QueryRequest) -> dict[str, Any]:
         reflection = result.get("reflection") or {}
         if not accepted and not reflection.get("reason"):
             reflection["reason"] = "The answer was generated from available invoice evidence, but the quality evaluator did not approve it. Verify the cited invoice facts before acting."
+        ragas = result.get("ragas") or {}
+        try:
+            db.execute("""INSERT INTO audit.rag_evaluations
+                (invoice_id, question, answer, route, metrics, overall_score, accepted)
+                VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s)""",
+                [request.invoice_id, question, answer, "rag", json.dumps(ragas), ragas.get("overall", reflection.get("overall_score", 0.0)), accepted])
+        except Exception:
+            logger.exception("Could not persist RAG evaluation")
         return {
-            "question": question,
-            "invoice_id": request.invoice_id,
-            "answer": answer,
-            "documents": result.get("documents", []),
-            "reflection": reflection,
-            "accepted": accepted,
-            "retry_count": int(result.get("retry_count", 0)),
+            "question": question, "invoice_id": request.invoice_id, "answer": answer,
+            "documents": result.get("documents", []), "reflection": reflection,
+            "accepted": accepted, "retry_count": int(result.get("retry_count", 0)),
             "fallback": structured_used or not accepted,
-            "answer_source": "hybrid_rag" if structured_used else "semantic_rag",
-            "answer_needs_verification": not accepted,
+            "answer_source": "semantic_rag", "answer_needs_verification": not accepted,
+            "route": "rag", "ragas": ragas,
         }
 
     # Bedrock generation can fail even when the saved audit facts are present.
@@ -853,6 +914,7 @@ def query_invoice(request: QueryRequest) -> dict[str, Any]:
                     "retry_count": int(result.get("retry_count", 0)),
                     "fallback": True,
                     "answer_source": "saved_audit_analysis",
+                    "route": "rag", "ragas": result.get("ragas") or {"available": False, "source": "fallback"},
                     "answer_needs_verification": True,
                 }
         except Exception:
@@ -878,7 +940,8 @@ def query_invoice(request: QueryRequest) -> dict[str, Any]:
                 "answer": answer, "documents": result.get("documents", []),
                 "reflection": result.get("reflection") or {"reason": "The answer model returned no answer."},
                 "accepted": False, "retry_count": int(result.get("retry_count", 0)),
-                "fallback": True, "answer_source": "saved_audit_status",
+                "fallback": True, "answer_source": "saved_audit_status", "route": "rag",
+                "ragas": result.get("ragas") or {"available": False, "source": "fallback"},
                 "answer_needs_verification": True,
             }
 
@@ -895,6 +958,18 @@ def query_invoice(request: QueryRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 # Report
 # ------------------------------------------------------------------
+
+@app.get("/api/invoices/{invoice_id}/report/html", response_class=HTMLResponse)
+def get_invoice_report_html(invoice_id: str):
+    invoice = db.fetch_one("SELECT report_path FROM audit.invoices WHERE invoice_id = %s", [invoice_id])
+    if not invoice or not invoice.get("report_path"):
+        raise HTTPException(status_code=404, detail="HTML report not available")
+    path = Path(str(invoice["report_path"]))
+    html_path = path.with_suffix(".html")
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="HTML report not found")
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
 
 @app.get(
     "/api/invoices/{invoice_id}/report"
